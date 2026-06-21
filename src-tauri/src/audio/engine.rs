@@ -492,6 +492,11 @@ struct ActiveStream {
     _stream: cpal::Stream,
     cmd_tx: rtrb::Producer<PlayCommand>,
     out_rate: u32,
+    /// Incremented once per real-time callback invocation. Lets the host thread
+    /// confirm the driver actually started firing callbacks — ASIO devices can
+    /// open "dead" (build + play succeed, but no callback ever runs), and the
+    /// only cure is tearing the stream down and rebuilding it.
+    heartbeat: Arc<AtomicU64>,
     debug: StreamDebugInfo,
 }
 
@@ -561,6 +566,67 @@ fn best_output_summary(device: &cpal::Device) -> Option<(usize, u32)> {
     Some((cfg.channels() as usize, cfg.sample_rate().0))
 }
 
+/// Fade-in used when a pad is auto-restored onto a freshly-rebuilt stream
+/// (device or channel switch). Deliberately short — the device reopen already
+/// introduced a brief gap, so we want the pad back quickly rather than easing
+/// it in over the full crossfade duration.
+const RESTORE_FADE_MS: u32 = 200;
+
+/// Brief pause after releasing the old stream before opening the new one. Some
+/// ASIO drivers don't fully relinquish the device synchronously when their
+/// stream is dropped; this gives the driver a moment to settle so the re-open
+/// lands cleanly instead of racing a half-closed driver. Only applied when we
+/// actually dropped a prior stream, so a first-time open stays instant.
+const ASIO_RELEASE_SETTLE: Duration = Duration::from_millis(75);
+
+/// Spawn a decoder for `path`, push it onto the active stream as a fading-in
+/// pad voice, and start a watcher tied to a fresh pad generation. Shared by the
+/// `Play` command and the auto-restore that runs after a stream rebuild so both
+/// paths produce identical voice + watcher wiring.
+fn start_pad_voice(
+    act: &mut ActiveStream,
+    path: PathBuf,
+    fade_in_ms: u32,
+    pad_generation: &Arc<AtomicU64>,
+    notify_tx: &Sender<HostNotify>,
+) {
+    let dec = decode::spawn(path, act.out_rate, true, false);
+    let voice = Voice {
+        consumer: dec.consumer,
+        stop: dec.stop,
+        ended: dec.ended.clone(),
+        bus: VoiceBus::Pad,
+        gain: 0.0,
+        target: 1.0,
+        step: fade_step(fade_in_ms, act.out_rate),
+        remove_when_silent: false,
+    };
+    let _ = act.cmd_tx.push(PlayCommand::Crossfade(voice));
+    // Bump the pad generation, then spawn a watcher tied to this generation. If
+    // the decoder later exits for any reason — natural crossfade-stop, explicit
+    // Stop, or an error mid-set — the host will see NotifyPadEnded. The host
+    // only emits EngineEvent::PadEnded when the generation still matches: a
+    // crossfade or Stop bumps the generation first, so those legitimate exits
+    // stay quiet.
+    let my_gen = pad_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    let watcher_ended = dec.ended;
+    let watcher_notify = notify_tx.clone();
+    let watcher_gen_arc = pad_generation.clone();
+    std::thread::Builder::new()
+        .name("pad-watcher".into())
+        .spawn(move || {
+            while !watcher_ended.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            // Skip post if the pad has already been replaced (saves a no-op
+            // trip through the host loop).
+            if watcher_gen_arc.load(Ordering::Relaxed) == my_gen {
+                let _ = watcher_notify.send(HostNotify::PadEnded(my_gen));
+            }
+        })
+        .ok();
+}
+
 fn host_thread(
     rx: Receiver<EngineCommand>,
     notify_rx: Receiver<HostNotify>,
@@ -582,6 +648,11 @@ fn host_thread(
         click: (2, 3),
         cue: (4, 5),
     };
+    // Path of the pad currently playing (looping), if any. Tracked so that when
+    // the stream is rebuilt for a device/channel switch — which drops the old
+    // stream and every voice it carried — we can re-spawn the same pad on the
+    // new stream and playback simply continues instead of going silent.
+    let mut current_pad: Option<PathBuf> = None;
     // Click state shadow — re-applied on every stream rebuild. `enabled` is
     // deliberately not seeded from settings on boot (worship leaders shouldn't
     // be surprised by a live click on launch); the desktop/remote toggle it on.
@@ -642,9 +713,24 @@ fn host_thread(
                         click: click_channels,
                         cue: cue_channels,
                     };
+                    // Release the current stream BEFORE opening the next one.
+                    // ASIO drivers are single-client: holding the old stream
+                    // open while building the new one makes the re-open produce
+                    // no audio, which is why a channel/device change needed a
+                    // toggle away-and-back to come alive. Dropping first frees
+                    // the driver so the new stream opens hot and outputs
+                    // immediately. Trade-off: if the new open fails we no longer
+                    // fall back to the old stream — but a silent "switched but
+                    // dead" device is exactly the bug we're fixing, and the
+                    // error is surfaced to the UI either way.
+                    let had_stream = active.take().is_some();
+                    has_active.store(false, Ordering::Relaxed);
+                    if had_stream {
+                        std::thread::sleep(ASIO_RELEASE_SETTLE);
+                    }
                     build_in_progress.store(true, Ordering::Relaxed);
                     let result =
-                        build_stream(&host, &device, channels, master, cue_volume, click_init);
+                        build_stream_live(&host, &device, channels, master, cue_volume, click_init);
                     build_in_progress.store(false, Ordering::Relaxed);
                     match result {
                         Ok(stream) => {
@@ -665,6 +751,18 @@ fn host_thread(
                             last_channels = channels;
                             active = Some(stream);
                             has_active.store(true, Ordering::Relaxed);
+                            // Re-spawn the pad that was playing before the
+                            // rebuild so a device/channel switch is seamless —
+                            // the user doesn't have to manually re-trigger it.
+                            if let (Some(act), Some(path)) = (active.as_mut(), current_pad.clone()) {
+                                start_pad_voice(
+                                    act,
+                                    path,
+                                    RESTORE_FADE_MS,
+                                    &pad_generation,
+                                    &notify_tx,
+                                );
+                            }
                             let _ = reply.send(Ok(()));
                         }
                         Err(e) => {
@@ -697,8 +795,23 @@ fn host_thread(
                         click: channels,
                         ..last_channels
                     };
+                    // Release the current stream BEFORE opening the next one.
+                    // ASIO drivers are single-client: holding the old stream
+                    // open while building the new one makes the re-open produce
+                    // no audio, which is why a channel/device change needed a
+                    // toggle away-and-back to come alive. Dropping first frees
+                    // the driver so the new stream opens hot and outputs
+                    // immediately. Trade-off: if the new open fails we no longer
+                    // fall back to the old stream — but a silent "switched but
+                    // dead" device is exactly the bug we're fixing, and the
+                    // error is surfaced to the UI either way.
+                    let had_stream = active.take().is_some();
+                    has_active.store(false, Ordering::Relaxed);
+                    if had_stream {
+                        std::thread::sleep(ASIO_RELEASE_SETTLE);
+                    }
                     build_in_progress.store(true, Ordering::Relaxed);
-                    let result = build_stream(
+                    let result = build_stream_live(
                         &last_host,
                         &last_device,
                         next,
@@ -718,6 +831,18 @@ fn host_thread(
                             last_channels = next;
                             active = Some(stream);
                             has_active.store(true, Ordering::Relaxed);
+                            // Re-spawn the pad that was playing before the
+                            // rebuild so a device/channel switch is seamless —
+                            // the user doesn't have to manually re-trigger it.
+                            if let (Some(act), Some(path)) = (active.as_mut(), current_pad.clone()) {
+                                start_pad_voice(
+                                    act,
+                                    path,
+                                    RESTORE_FADE_MS,
+                                    &pad_generation,
+                                    &notify_tx,
+                                );
+                            }
                             let _ = reply.send(Ok(()));
                         }
                         Err(e) => {
@@ -745,8 +870,23 @@ fn host_thread(
                         cue: channels,
                         ..last_channels
                     };
+                    // Release the current stream BEFORE opening the next one.
+                    // ASIO drivers are single-client: holding the old stream
+                    // open while building the new one makes the re-open produce
+                    // no audio, which is why a channel/device change needed a
+                    // toggle away-and-back to come alive. Dropping first frees
+                    // the driver so the new stream opens hot and outputs
+                    // immediately. Trade-off: if the new open fails we no longer
+                    // fall back to the old stream — but a silent "switched but
+                    // dead" device is exactly the bug we're fixing, and the
+                    // error is surfaced to the UI either way.
+                    let had_stream = active.take().is_some();
+                    has_active.store(false, Ordering::Relaxed);
+                    if had_stream {
+                        std::thread::sleep(ASIO_RELEASE_SETTLE);
+                    }
                     build_in_progress.store(true, Ordering::Relaxed);
-                    let result = build_stream(
+                    let result = build_stream_live(
                         &last_host,
                         &last_device,
                         next,
@@ -766,6 +906,18 @@ fn host_thread(
                             last_channels = next;
                             active = Some(stream);
                             has_active.store(true, Ordering::Relaxed);
+                            // Re-spawn the pad that was playing before the
+                            // rebuild so a device/channel switch is seamless —
+                            // the user doesn't have to manually re-trigger it.
+                            if let (Some(act), Some(path)) = (active.as_mut(), current_pad.clone()) {
+                                start_pad_voice(
+                                    act,
+                                    path,
+                                    RESTORE_FADE_MS,
+                                    &pad_generation,
+                                    &notify_tx,
+                                );
+                            }
                             let _ = reply.send(Ok(()));
                         }
                         Err(e) => {
@@ -779,47 +931,18 @@ fn host_thread(
                 }
                 EngineCommand::Play(path) => {
                     if let Some(act) = active.as_mut() {
-                        let dec = decode::spawn(path, act.out_rate, true, false);
-                        let voice = Voice {
-                            consumer: dec.consumer,
-                            stop: dec.stop,
-                            ended: dec.ended.clone(),
-                            bus: VoiceBus::Pad,
-                            gain: 0.0,
-                            target: 1.0,
-                            step: fade_step(crossfade_ms, act.out_rate),
-                            remove_when_silent: false,
-                        };
-                        let _ = act.cmd_tx.push(PlayCommand::Crossfade(voice));
-                        // Bump the pad generation, then spawn a watcher tied to
-                        // this generation. If the decoder later exits for any
-                        // reason — natural crossfade-stop, explicit Stop, or an
-                        // error mid-set — the host will see NotifyPadEnded.
-                        // The host only emits EngineEvent::PadEnded when the
-                        // generation still matches: a crossfade or Stop bumps the
-                        // generation first, so those legitimate exits stay quiet.
-                        let my_gen = pad_generation.fetch_add(1, Ordering::Relaxed) + 1;
-                        let watcher_ended = dec.ended;
-                        let watcher_notify = notify_tx.clone();
-                        let watcher_gen_arc = pad_generation.clone();
-                        std::thread::Builder::new()
-                            .name("pad-watcher".into())
-                            .spawn(move || {
-                                while !watcher_ended.load(Ordering::Relaxed) {
-                                    std::thread::sleep(Duration::from_millis(200));
-                                }
-                                // Skip post if the pad has already been replaced
-                                // (saves a no-op trip through the host loop).
-                                if watcher_gen_arc.load(Ordering::Relaxed) == my_gen {
-                                    let _ = watcher_notify.send(HostNotify::PadEnded(my_gen));
-                                }
-                            })
-                            .ok();
+                        // Remember the pad so a later device/channel switch can
+                        // re-spawn it on the rebuilt stream and keep it playing.
+                        current_pad = Some(path.clone());
+                        start_pad_voice(act, path, crossfade_ms, &pad_generation, &notify_tx);
                     } else {
                         eprintln!("[audio] Play ignored: no output device configured");
                     }
                 }
                 EngineCommand::Stop => {
+                    // User stopped the pad — don't auto-restore it on the next
+                    // stream rebuild.
+                    current_pad = None;
                     if let Some(act) = active.as_mut() {
                         // Invalidate the current pad watcher so its eventual
                         // PadEnded post is ignored — the user initiated the stop,
@@ -1035,6 +1158,10 @@ fn host_thread(
                     // the generation so subsequent state changes don't fire
                     // again for the same voice.
                     pad_generation.fetch_add(1, Ordering::Relaxed);
+                    // The pad is no longer playing (file moved, share dropped),
+                    // so drop it from auto-restore — re-spawning on the next
+                    // device switch would just fail the same way.
+                    current_pad = None;
                     let _ = events.send(EngineEvent::PadEnded);
                 }
             }
@@ -1179,16 +1306,19 @@ fn build_stream(
     // Lock-free queue: host thread → real-time callback.
     let (cmd_tx, cmd_rx) = RingBuffer::<PlayCommand>::new(64);
 
+    // Callback liveness counter (see `ActiveStream::heartbeat`).
+    let heartbeat = Arc::new(AtomicU64::new(0));
+
     let err_fn = |err| eprintln!("[audio] stream error: {err}");
     let stream = match sample_format {
         SampleFormat::F32 => {
-            let cb = build_callback_f32(layout, master, cue_volume, click_gen, cmd_rx);
+            let cb = build_callback_f32(layout, master, cue_volume, click_gen, cmd_rx, heartbeat.clone());
             device
                 .build_output_stream(&config, cb, err_fn, None)
                 .map_err(|e| format!("build output stream (f32): {e}"))?
         }
         SampleFormat::I32 => {
-            let cb = build_callback_i32(layout, master, cue_volume, click_gen, cmd_rx);
+            let cb = build_callback_i32(layout, master, cue_volume, click_gen, cmd_rx, heartbeat.clone());
             device
                 .build_output_stream(&config, cb, err_fn, None)
                 .map_err(|e| format!("build output stream (i32): {e}"))?
@@ -1202,6 +1332,7 @@ fn build_stream(
         _stream: stream,
         cmd_tx,
         out_rate,
+        heartbeat,
         debug: StreamDebugInfo {
             host: host_label.to_string(),
             device: device_name.to_string(),
@@ -1211,6 +1342,73 @@ fn build_stream(
             pad_channels: channels.pad,
         },
     })
+}
+
+/// How long to wait for the freshly-built stream's callback to fire at least
+/// once before declaring it dead. A healthy driver fires within a few ms; ASIO
+/// devices that opened dead never fire at all.
+const LIVENESS_POLL_STEP: Duration = Duration::from_millis(25);
+const LIVENESS_POLL_STEPS: u32 = 16; // 16 × 25 ms = up to 400 ms
+
+/// Settle delays (ms) before each successive reopen when a stream comes up
+/// dead. Increasing backoff: some ASIO drivers wake on a near-immediate
+/// teardown+rebuild, others only relinquish/restart the device after real
+/// wall-clock time has passed since the failed open. The schedule's length also
+/// sets how many reopen attempts we make on top of the initial open.
+const DEAD_STREAM_REOPEN_BACKOFF_MS: [u64; 4] = [150, 400, 900, 1600];
+
+/// Wait until the stream's callback has fired (driver is genuinely running), or
+/// give up after the poll budget. Returns true if at least one callback ran.
+fn stream_is_live(act: &ActiveStream) -> bool {
+    let start = act.heartbeat.load(Ordering::Relaxed);
+    for _ in 0..LIVENESS_POLL_STEPS {
+        std::thread::sleep(LIVENESS_POLL_STEP);
+        if act.heartbeat.load(Ordering::Relaxed) > start {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build a stream and confirm the driver actually started firing callbacks,
+/// reopening if it came up dead. This is the generic cure for the "no signal
+/// until I change a channel" symptom: an ASIO device can accept the stream and
+/// report `play()` success yet never run a single callback, so audio is silent
+/// until the stream is torn down and rebuilt. Each retry releases the prior
+/// attempt (single-client drivers can't be double-opened) and waits the ASIO
+/// settle interval before reopening.
+fn build_stream_live(
+    host_label: &str,
+    device_name: &str,
+    channels: ChannelLayout,
+    master: f32,
+    cue_volume: f32,
+    click_init: ClickInit,
+) -> Result<ActiveStream, String> {
+    let mut stream = build_stream(host_label, device_name, channels, master, cue_volume, click_init)?;
+    if stream_is_live(&stream) {
+        return Ok(stream);
+    }
+    let attempts = DEAD_STREAM_REOPEN_BACKOFF_MS.len();
+    for (i, &settle_ms) in DEAD_STREAM_REOPEN_BACKOFF_MS.iter().enumerate() {
+        eprintln!(
+            "[audio] '{device_name}' opened but no callbacks fired — reopening after {settle_ms}ms (attempt {}/{attempts})",
+            i + 1
+        );
+        // Drop releases the dead stream (and its driver claim) before we retry.
+        drop(stream);
+        std::thread::sleep(Duration::from_millis(settle_ms));
+        stream = build_stream(host_label, device_name, channels, master, cue_volume, click_init)?;
+        if stream_is_live(&stream) {
+            eprintln!("[audio] '{device_name}' is now live after reopen");
+            return Ok(stream);
+        }
+    }
+    // Still no heartbeat after retries. Hand back the last stream anyway rather
+    // than dropping audio entirely — better a possibly-silent stream the user
+    // can re-poke than a hard failure, and a few drivers under-report.
+    eprintln!("[audio] '{device_name}' still reported no callbacks after reopen attempts");
+    Ok(stream)
 }
 
 /// Synthesized click. Lives entirely inside the real-time callback: no
@@ -1573,6 +1771,7 @@ fn build_callback_f32(
     cue_volume_init: f32,
     click_init: ClickGen,
     mut cmd_rx: rtrb::Consumer<PlayCommand>,
+    heartbeat: Arc<AtomicU64>,
 ) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut voices: Vec<Voice> = Vec::with_capacity(4);
     let mut master = master_init;
@@ -1581,6 +1780,7 @@ fn build_callback_f32(
     let mut diagnostic: Option<DiagnosticTone> = None;
 
     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        heartbeat.fetch_add(1, Ordering::Relaxed);
         drain_commands(
             &mut voices,
             &mut master,
@@ -1608,6 +1808,7 @@ fn build_callback_i32(
     cue_volume_init: f32,
     click_init: ClickGen,
     mut cmd_rx: rtrb::Consumer<PlayCommand>,
+    heartbeat: Arc<AtomicU64>,
 ) -> impl FnMut(&mut [i32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut voices: Vec<Voice> = Vec::with_capacity(4);
     let mut master = master_init;
@@ -1623,6 +1824,7 @@ fn build_callback_i32(
     let mut scratch = [0.0f32; 64];
 
     move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
+        heartbeat.fetch_add(1, Ordering::Relaxed);
         drain_commands(
             &mut voices,
             &mut master,

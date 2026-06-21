@@ -79,8 +79,9 @@ export function SettingsPage({
           onChange={(v) =>
             guard(async () => {
               const [host, name] = splitDeviceKey(v);
-              // Reset pad routing to 1/2 on switch — channel indexes from the
-              // previous device may not exist on the new one.
+              // The backend restores this device's saved routing if we've used
+              // it before; the 1/2 pad pair here is only the fallback for a
+              // device seen for the first time.
               await setAudioOutput(host, name, 0, 1);
               await refreshSettings();
             })

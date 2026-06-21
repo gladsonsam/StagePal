@@ -293,23 +293,39 @@ pub fn set_audio_output(
     channel_left: usize,
     channel_right: usize,
 ) -> Result<(), String> {
-    // Snap click channels to something sensible for the new device. Keep the
-    // user's existing click pair if it still fits; otherwise default to (2,3)
-    // when the device has ≥4 channels, else fold onto (0,1) — which will mix
-    // the click into the pad bus.
-    let (click_l, click_r, cue_l, cue_r) = {
+    // Resolve the full pad/click/cue routing to apply. Two cases:
+    //   - Switching to a different device: if we've used this device before,
+    //     restore the channels saved for it (so it doesn't snap back to 1/2);
+    //     otherwise fall back to the requested pad pair plus the current
+    //     click/cue pairs as a starting point.
+    //   - Editing the pad channels on the current device: honour the requested
+    //     pad pair and leave click/cue untouched.
+    let ((pad_l, pad_r), (click_l, click_r), (cue_l, cue_r)) = {
         let s = core.settings.lock().unwrap();
-        (
-            s.click.channel_left,
-            s.click.channel_right,
-            s.cues.channel_left,
-            s.cues.channel_right,
-        )
+        let switching =
+            s.output_host != host || s.output_device.as_deref() != Some(device.as_str());
+        let saved = if switching {
+            s.device_routes.get(&Settings::device_key(&host, &device)).copied()
+        } else {
+            None
+        };
+        match saved {
+            Some(r) => (
+                (r.pad_left, r.pad_right),
+                (r.click_left, r.click_right),
+                (r.cue_left, r.cue_right),
+            ),
+            None => (
+                (channel_left, channel_right),
+                (s.click.channel_left, s.click.channel_right),
+                (s.cues.channel_left, s.cues.channel_right),
+            ),
+        }
     };
     engine.set_output(
         &host,
         &device,
-        (channel_left, channel_right),
+        (pad_l, pad_r),
         (click_l, click_r),
         (cue_l, cue_r),
     )?;
@@ -317,8 +333,14 @@ pub fn set_audio_output(
         let mut s = core.settings.lock().unwrap();
         s.output_host = host;
         s.output_device = Some(device);
-        s.channel_left = channel_left;
-        s.channel_right = channel_right;
+        s.channel_left = pad_l;
+        s.channel_right = pad_r;
+        s.click.channel_left = click_l;
+        s.click.channel_right = click_r;
+        s.cues.channel_left = cue_l;
+        s.cues.channel_right = cue_r;
+        // Remember this routing for the device so reselecting it restores it.
+        s.remember_current_route();
     }
     core.save()
 }
@@ -592,6 +614,7 @@ pub fn set_click_channels_logic(
         let mut s = core.settings.lock().unwrap();
         s.click.channel_left = channel_left;
         s.click.channel_right = channel_right;
+        s.remember_current_route();
     }
     core.save()
 }
@@ -844,6 +867,7 @@ pub fn set_cue_channels_logic(
         let mut s = core.settings.lock().unwrap();
         s.cues.channel_left = channel_left;
         s.cues.channel_right = channel_right;
+        s.remember_current_route();
     }
     core.save()
 }

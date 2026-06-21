@@ -139,6 +139,19 @@ pub struct Preset {
     pub unmapped: Vec<PathBuf>,
 }
 
+/// Saved pad/click/cue channel routing for one output device. Remembered per
+/// device so returning to a previously-used interface restores the exact
+/// channels you last picked there instead of snapping back to 1/2.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct DeviceRoute {
+    pub pad_left: usize,
+    pub pad_right: usize,
+    pub click_left: usize,
+    pub click_right: usize,
+    pub cue_left: usize,
+    pub cue_right: usize,
+}
+
 /// Persisted application settings.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
@@ -161,6 +174,11 @@ pub struct Settings {
     /// TTS cue config. `#[serde(default)]` keeps pre-cues settings files loadable.
     #[serde(default)]
     pub cues: CueSettings,
+    /// Per-device channel routing memory, keyed by `device_key(host, device)`.
+    /// Lets the app restore the channels last used on each interface rather
+    /// than resetting to 1/2 every time the device is reselected.
+    #[serde(default)]
+    pub device_routes: HashMap<String, DeviceRoute>,
 }
 
 /// Persisted click-track configuration. The live `enabled` flag is intentionally
@@ -261,6 +279,7 @@ impl Default for Settings {
             server_port: 7777,
             click: ClickSettings::default(),
             cues: CueSettings::default(),
+            device_routes: HashMap::new(),
         }
     }
 }
@@ -269,6 +288,34 @@ impl Settings {
     pub fn active_preset(&self) -> Option<&Preset> {
         let id = self.active_preset.as_deref()?;
         self.presets.iter().find(|p| p.id == id)
+    }
+
+    /// Stable map key for per-device routing memory.
+    pub fn device_key(host: &str, device: &str) -> String {
+        format!("{host}::{device}")
+    }
+
+    /// The current pad/click/cue channels as a `DeviceRoute`.
+    pub fn current_route(&self) -> DeviceRoute {
+        DeviceRoute {
+            pad_left: self.channel_left,
+            pad_right: self.channel_right,
+            click_left: self.click.channel_left,
+            click_right: self.click.channel_right,
+            cue_left: self.cues.channel_left,
+            cue_right: self.cues.channel_right,
+        }
+    }
+
+    /// Snapshot the current routing into `device_routes` under the active
+    /// device, so reselecting it later restores these channels. No-op when no
+    /// device is selected.
+    pub fn remember_current_route(&mut self) {
+        if let Some(device) = self.output_device.clone() {
+            let key = Self::device_key(&self.output_host, &device);
+            let route = self.current_route();
+            self.device_routes.insert(key, route);
+        }
     }
 }
 
