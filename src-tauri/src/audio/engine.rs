@@ -579,6 +579,19 @@ const RESTORE_FADE_MS: u32 = 200;
 /// actually dropped a prior stream, so a first-time open stays instant.
 const ASIO_RELEASE_SETTLE: Duration = Duration::from_millis(75);
 
+/// How long to let a *cold* ASIO stream actually run before tearing it down to
+/// prime the driver (see the cold-open prime in `build_stream_live`). The manual
+/// cure — "change a channel, then change back" — leaves the first stream running
+/// for a beat before the reopen, and some virtual ASIO drivers (notably
+/// Voicemeeter's Virtual ASIO) only start routing audio on a reopen that follows
+/// a stream that was genuinely running. Reproduce that dwell time here.
+const COLD_OPEN_WARMUP: Duration = Duration::from_millis(600);
+
+/// Settle after releasing the warmed-up cold stream, before the priming reopen.
+/// Longer than `ASIO_RELEASE_SETTLE` because virtual ASIO drivers can take a
+/// little longer to fully relinquish the device than hardware ones.
+const COLD_OPEN_REOPEN_SETTLE: Duration = Duration::from_millis(250);
+
 /// Spawn a decoder for `path`, push it onto the active stream as a fading-in
 /// pad voice, and start a watcher tied to a fresh pad generation. Shared by the
 /// `Play` command and the auto-restore that runs after a stream rebuild so both
@@ -729,8 +742,17 @@ fn host_thread(
                         std::thread::sleep(ASIO_RELEASE_SETTLE);
                     }
                     build_in_progress.store(true, Ordering::Relaxed);
-                    let result =
-                        build_stream_live(&host, &device, channels, master, cue_volume, click_init);
+                    // `!had_stream` == cold open: no live stream preceded this,
+                    // so the new one must be primed (see build_stream_live).
+                    let result = build_stream_live(
+                        &host,
+                        &device,
+                        channels,
+                        master,
+                        cue_volume,
+                        click_init,
+                        !had_stream,
+                    );
                     build_in_progress.store(false, Ordering::Relaxed);
                     match result {
                         Ok(stream) => {
@@ -818,6 +840,7 @@ fn host_thread(
                         master,
                         cue_volume,
                         click_init,
+                        !had_stream,
                     );
                     build_in_progress.store(false, Ordering::Relaxed);
                     match result {
@@ -893,6 +916,7 @@ fn host_thread(
                         master,
                         cue_volume,
                         click_init,
+                        !had_stream,
                     );
                     build_in_progress.store(false, Ordering::Relaxed);
                     match result {
@@ -1256,6 +1280,20 @@ struct ChannelLayout {
     cue: (usize, usize),
 }
 
+/// A deliberately-different, always-valid routing used to "wiggle" an ASIO
+/// driver during a cold-open prime (see `build_stream_live`): every bus
+/// collapsed onto a single channel. Channel 0 exists on every device; if the
+/// real pad pair is already there we use channel 1 instead, so the routing the
+/// driver sees genuinely changes (the prime relies on the layout differing).
+fn decoy_layout(real: ChannelLayout) -> ChannelLayout {
+    let ch = if real.pad == (0, 0) { 1 } else { 0 };
+    ChannelLayout {
+        pad: (ch, ch),
+        click: (ch, ch),
+        cue: (ch, ch),
+    }
+}
+
 fn build_stream(
     host_label: &str,
     device_name: &str,
@@ -1377,6 +1415,11 @@ fn stream_is_live(act: &ActiveStream) -> bool {
 /// until the stream is torn down and rebuilt. Each retry releases the prior
 /// attempt (single-client drivers can't be double-opened) and waits the ASIO
 /// settle interval before reopening.
+///
+/// `cold_open` is true when this is the first stream of the session for the
+/// driver — i.e. the host thread held no live stream beforehand (boot
+/// auto-restore, or selecting a device when none was open). See the cold-open
+/// prime below for why that case needs special handling.
 fn build_stream_live(
     host_label: &str,
     device_name: &str,
@@ -1384,8 +1427,55 @@ fn build_stream_live(
     master: f32,
     cue_volume: f32,
     click_init: ClickInit,
+    cold_open: bool,
 ) -> Result<ActiveStream, String> {
     let mut stream = build_stream(host_label, device_name, channels, master, cue_volume, click_init)?;
+
+    // A *cold* first open of an ASIO driver is the unreliable one. The driver
+    // accepts the stream and fires its data callback (so `heartbeat` ticks and
+    // `stream_is_live` returns true), yet routes no audio to the hardware until
+    // its buffers are torn down and re-prepared — it comes up "alive-but-silent".
+    // That is the "no signal until I change a channel" bug: a manual channel
+    // change works only because it drops a prior running stream and reopens, so
+    // its open is the *second* (warm) one. On boot there is no prior stream, so
+    // the cold open is trusted as-is and stays silent.
+    //
+    // Replicate, in code, the exact sequence that works by hand ("go to channel
+    // 1, then back to the appropriate channel"). A same-config reopen is not
+    // enough for Voicemeeter's Virtual ASIO — the routing must actually change
+    // and change back:
+    //   1. let the initial (silent) cold stream run so the driver fully starts,
+    //   2. reopen on a decoy routing, let it run,
+    //   3. reopen on the real routing — the open that finally routes audio.
+    // Nothing is audible during 1–2: at a cold open no pad/cue voice exists yet
+    // and the click boots disabled. Gated on a genuinely cold open AND ASIO, so
+    // WASAPI is untouched and a warm channel change never pays this cost.
+    if cold_open && host_label.eq_ignore_ascii_case("ASIO") {
+        let decoy = decoy_layout(channels);
+        eprintln!(
+            "[audio] priming cold ASIO open of '{device_name}': real -> decoy {decoy:?} -> real"
+        );
+        let _ = stream_is_live(&stream);
+        std::thread::sleep(COLD_OPEN_WARMUP);
+        drop(stream);
+        std::thread::sleep(COLD_OPEN_REOPEN_SETTLE);
+
+        // The decoy build can legitimately fail (e.g. a 1-channel device); if it
+        // does, skip the wiggle and just reopen on the real layout below.
+        match build_stream(host_label, device_name, decoy, master, cue_volume, click_init) {
+            Ok(decoy_stream) => {
+                let _ = stream_is_live(&decoy_stream);
+                std::thread::sleep(COLD_OPEN_WARMUP);
+                drop(decoy_stream);
+                std::thread::sleep(COLD_OPEN_REOPEN_SETTLE);
+            }
+            Err(e) => eprintln!("[audio] cold-open decoy reopen skipped: {e}"),
+        }
+
+        stream =
+            build_stream(host_label, device_name, channels, master, cue_volume, click_init)?;
+    }
+
     if stream_is_live(&stream) {
         return Ok(stream);
     }
