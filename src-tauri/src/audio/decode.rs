@@ -1,10 +1,9 @@
-//! Streaming decoder: reads a pad file, resamples it to the device sample rate,
-//! loops it seamlessly, and pushes interleaved-stereo f32 samples into a
-//! lock-free ring buffer that the audio callback drains.
+//! Streaming decoder: decodes a pad file, resamples to the device rate, loops
+//! seamlessly, and pushes interleaved-stereo f32 into a lock-free ring the audio
+//! callback drains.
 //!
-//! All the heavy lifting (file IO, MP3/AAC/FLAC decode, sample-rate conversion)
-//! happens here on a dedicated thread — never inside the real-time audio
-//! callback. A multi-minute pad is streamed, not decoded into memory up front.
+//! All heavy lifting (IO, decode, resample) runs on a dedicated thread, never in
+//! the real-time callback. Pads are streamed, not decoded into memory up front.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -23,15 +22,13 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-/// Input frames fed to the resampler per call.
+/// Input frames per resampler call.
 const CHUNK: usize = 1024;
 
-/// Handle to a running decoder thread. The audio callback owns the `consumer`;
-/// dropping the owning `Voice` flips `stop`, which makes the decoder thread exit.
-/// `ended` is set true the moment the decoder thread is no longer producing
-/// samples (either reached EOF on a non-looping source or was asked to stop) —
-/// used by the host thread to fire a "cue ended" event without polling audio
-/// callback state.
+/// Handle to a running decoder thread. Dropping the owning `Voice` flips `stop`
+/// to make the thread exit. `ended` goes true when the thread stops producing
+/// (EOF on a non-looping source, or stopped) so the host can fire "cue ended"
+/// without polling the audio callback.
 pub struct Decoder {
     pub consumer: Consumer<f32>,
     pub stop: Arc<AtomicBool>,
@@ -39,13 +36,10 @@ pub struct Decoder {
 }
 
 /// Spawn a decoder thread for `path`, producing interleaved-stereo f32 at `out_rate`.
-/// When `loop_when_eof` is true (pads), the decoder reopens the source on EOF
-/// for seamless looping. When false (one-shot cues / spoken WAVs), the decoder
-/// exits cleanly at EOF and flips `ended`. If `delete_on_exit` is true, `path`
-/// is removed after the decoder finishes — used for synthesized cue WAVs we
-/// own in %TEMP%.
+/// `loop_when_eof` reopens the source on EOF (pads); otherwise it exits and flips
+/// `ended` (one-shot cues). `delete_on_exit` removes `path` afterward (temp cue WAVs).
 pub fn spawn(path: PathBuf, out_rate: u32, loop_when_eof: bool, delete_on_exit: bool) -> Decoder {
-    // ~2 seconds of stereo headroom in the ring buffer.
+    // ~2s of stereo headroom.
     let capacity = (out_rate as usize * 2 * 2).max(16384);
     let (producer, consumer) = RingBuffer::<f32>::new(capacity);
     let stop = Arc::new(AtomicBool::new(false));
@@ -146,7 +140,7 @@ fn make_resampler(in_rate: u32, out_rate: u32) -> Result<SincFixedIn<f32>, Strin
         2.0,
         params,
         CHUNK,
-        2, // we always feed stereo
+        2, // always stereo
     )
     .map_err(|e| format!("resampler init: {e}"))
 }
@@ -166,7 +160,7 @@ fn decode_loop(
         None
     };
 
-    // Pending decoded stereo, deinterleaved into two planar channel buffers.
+    // Pending decoded stereo, deinterleaved into planar L/R.
     let mut pend_l: Vec<f32> = Vec::with_capacity(CHUNK * 4);
     let mut pend_r: Vec<f32> = Vec::with_capacity(CHUNK * 4);
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
@@ -179,9 +173,7 @@ fn decode_loop(
         let packet = match src.format.next_packet() {
             Ok(p) => p,
             Err(_) => {
-                // End of file → flush remaining whole chunks. Pads reopen the
-                // source for seamless looping; cues / spoken WAVs exit so the
-                // host thread can notice the decoder is done.
+                // EOF: flush whole chunks, then loop (pads) or exit (cues).
                 flush_chunks(&mut pend_l, &mut pend_r, resampler.as_mut(), &mut producer, stop)?;
                 if !loop_when_eof {
                     return Ok(());
@@ -196,7 +188,7 @@ fn decode_loop(
 
         let decoded = match src.decoder.decode(&packet) {
             Ok(d) => d,
-            Err(symphonia::core::errors::Error::DecodeError(_)) => continue, // skip a bad frame
+            Err(symphonia::core::errors::Error::DecodeError(_)) => continue, // skip bad frame
             Err(e) => return Err(format!("decode: {e}")),
         };
 
@@ -221,8 +213,7 @@ fn decode_loop(
     }
 }
 
-/// Take exactly CHUNK frames off the pending buffers, resample if needed,
-/// interleave, and push to the ring.
+/// Drain CHUNK frames, resample if needed, interleave, push to the ring.
 fn push_chunk(
     pend_l: &mut Vec<f32>,
     pend_r: &mut Vec<f32>,
@@ -245,7 +236,7 @@ fn push_chunk(
     Ok(())
 }
 
-/// At EOF, drop any partial remainder (< CHUNK) so the next loop starts clean.
+/// At EOF, drop the partial remainder (< CHUNK) so the next loop starts clean.
 fn flush_chunks(
     pend_l: &mut Vec<f32>,
     pend_r: &mut Vec<f32>,
@@ -264,7 +255,7 @@ fn flush_chunks(
 fn push_interleaved(left: &[f32], right: &[f32], producer: &mut Producer<f32>, stop: &AtomicBool) {
     for i in 0..left.len() {
         for s in [left[i], right[i]] {
-            // Spin until the ring has room; bail out if we're being torn down.
+            // Spin until the ring has room; bail on teardown.
             loop {
                 if producer.push(s).is_ok() {
                     break;

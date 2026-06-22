@@ -1,5 +1,4 @@
-// Animated four-bar "playing" indicator shown on the active pad. Each bar
-// pulses on its own delay so the wave looks organic.
+// Four-bar "playing" indicator; each bar pulses on its own delay.
 
 const BARS = [0, 1, 2, 3];
 

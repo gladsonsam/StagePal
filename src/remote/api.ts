@@ -1,6 +1,5 @@
-// REST + WebSocket transport to the Rust server (see src-tauri/src/server.rs).
-// All POST endpoints are fire-and-forget — the server broadcasts the new state
-// back over /ws, which the UI re-renders from.
+// REST + WebSocket transport to the Rust server (src-tauri/src/server.rs).
+// POSTs are fire-and-forget; the server broadcasts new state back over /ws.
 
 import type { NowPlaying } from "../shared/types";
 
@@ -20,7 +19,7 @@ export interface Info {
   presets: PresetBrief[];
   active_preset: string | null;
   mapped_keys: string[];
-  /** Active preset's key → file name (basename only, for pad labels). */
+  /** Active preset's key → file basename, for pad labels. */
   files: Record<string, string>;
   cues_quick: QuickCue[];
   now: NowPlaying;

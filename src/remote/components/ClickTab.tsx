@@ -153,19 +153,10 @@ function BpmBlock({ bpm }: { bpm: number }) {
   );
 }
 
-/**
- * Beat dots that pulse on the active beat. Computed from the server-stamped
- * started_at_ms + local clock so playback indication doesn't rely on per-tick
- * WS frames. Uses setInterval (not RAF) so it keeps ticking in background tabs.
- *
- * `clockOffset` (server clock − device clock, in ms) is added to Date.now()
- * so phones whose wall clock drifts from the host don't show offset dots.
- *
- * The active dot is rendered into the JSX className (not poked onto the DOM
- * imperatively) so parent re-renders — which arrive on every WS frame — can't
- * momentarily wipe the highlight. The `.one` accent on beat 1 lives in the
- * same string, so it's always present too.
- */
+// Beat dots predicted from server started_at_ms + local clock, so they don't
+// need per-tick WS frames. setInterval (not RAF) keeps ticking in background
+// tabs. clockOffset (server − device ms) corrects for phone clock drift. Active
+// dot lives in the JSX className so WS-driven re-renders can't wipe it.
 function BeatDots({
   beats,
   bpm,
@@ -187,9 +178,8 @@ function BeatDots({
   }, [enabled, startedAt]);
 
   const live = enabled && startedAt != null && bpm > 0;
-  // ((x % n) + n) % n so a slightly-negative elapsed (device clock briefly
-  // ahead of server, or clockOffset still settling) wraps cleanly to the
-  // last dot instead of producing a negative index that matches nothing.
+  // ((x % n) + n) % n so a slightly-negative elapsed wraps to the last dot
+  // instead of a negative index matching nothing.
   const beatsN = Math.max(1, beats);
   const current = live
     ? ((Math.floor(((Date.now() + clockOffset - startedAt) * bpm) / 60_000) %
@@ -210,7 +200,7 @@ function BeatDots({
   );
 }
 
-/** Rolling 5-tap window, median delta → BPM. Resets after 2.2s of idle. */
+/** Rolling 5-tap window, median delta → BPM. Resets after 2.2s idle. */
 function TapButton({ currentBpm: _currentBpm }: { currentBpm: number }) {
   const tapsRef = useRef<number[]>([]);
   const resetRef = useRef<number | null>(null);

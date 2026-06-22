@@ -1,5 +1,5 @@
-// Library page — list of pad banks, each expandable to show key→file mappings
-// and a resolver for files whose key the scanner couldn't guess.
+// Library page — pad banks, each expandable to key→file mappings plus a
+// resolver for files the scanner couldn't auto-key.
 
 import { useRef, useState } from "react";
 import {
@@ -85,7 +85,7 @@ export function LibraryPage({ settings, onAddFolder, guard, refreshSettings }: P
   );
 }
 
-/** One pad bank: header row + collapsible slot grid + unmapped resolver. */
+/** One pad bank: header + collapsible slot grid + unmapped resolver. */
 function Bank({
   preset,
   active,

@@ -1,5 +1,4 @@
-// Connect-phone modal — QR code + address pill + copy button. Floats over a
-// blurred scrim; the App shell owns the open/close state.
+// Connect-phone modal — QR code + address pill + copy button.
 
 import { useState } from "react";
 import { QRCodeSVG } from "qrcode.react";

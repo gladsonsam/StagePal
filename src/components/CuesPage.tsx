@@ -1,7 +1,5 @@
-// Cues page — quick-cue editor + free-form speak. Quick cues are the primary
-// way the band fires text during a service (one-tap from phone); free-form is
-// the desktop's "just say this" affordance. Editing happens here so phones
-// can't accidentally rewrite labels mid-set.
+// Cues page — quick-cue editor + free-form speak. Editing lives on desktop so
+// phones can't rewrite labels mid-set.
 
 import { useEffect, useRef, useState } from "react";
 import {
@@ -24,7 +22,7 @@ import { Card, Eyebrow, Icon, SelectField, Slider, Volume } from "./ui";
 
 interface Props {
   settings: Settings;
-  /** Live cue label being spoken, or null. Drives the "Speaking" banner. */
+  /** Label being spoken, or null. Drives the "Speaking" banner. */
   speakingLabel: string | null;
   speaking: boolean;
   guard: (fn: () => Promise<unknown>) => Promise<void>;
@@ -244,7 +242,7 @@ function CueRow({
   const [text, setText] = useState(cue.text);
   const lastSaved = useRef({ label: cue.label, text: cue.text });
 
-  // Pick up upstream edits (e.g. add/move) without trashing in-progress text.
+  // Pick up upstream edits without trashing in-progress text.
   useEffect(() => {
     if (lastSaved.current.label === cue.label && lastSaved.current.text === cue.text) {
       setLabel(cue.label);

@@ -190,8 +190,7 @@ function PianoKeyPair({
   );
 }
 
-/** Volume slider — keeps its own DOM value so dragging stays smooth even if a
- *  WS update arrives mid-drag (the original did this with `document.activeElement`). */
+/** Volume slider — keeps its own DOM value so a mid-drag WS update doesn't jump it. */
 function Volume({ value }: { value: number }) {
   const ref = useRef<HTMLInputElement>(null);
   const numRef = useRef<HTMLSpanElement>(null);

@@ -1,5 +1,4 @@
 // App shell: boot, top-level state, sidebar nav, error banner, modal toggle.
-// Each page is a self-contained component under src/components/.
 
 import { useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -78,8 +77,7 @@ function App() {
     };
   }, []);
 
-  // Keyboard: Space toggles click globally as long as no text input is focused
-  // so editing a bank name (etc.) isn't hijacked. Useful from any page.
+  // Space toggles click globally, unless a text input is focused.
   useEffect(() => {
     function isTextTarget(el: EventTarget | null) {
       if (!(el instanceof HTMLElement)) return false;

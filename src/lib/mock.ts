@@ -1,7 +1,5 @@
-// Dev-only stand-in for the Tauri backend so the UI can run (and be designed) in
-// a plain browser via `npm run dev`. This module is dynamically imported only
-// when running outside Tauri in a dev build, so it's excluded from production
-// bundles. It keeps just enough in-memory state to exercise every screen.
+// Dev-only in-memory stand-in for the Tauri backend so the UI runs in a plain
+// browser. Dynamically imported outside Tauri, so excluded from production.
 
 import type { DeviceInfo, NowPlaying, Preset, ServerUrl, Settings } from "./ipc";
 
@@ -259,7 +257,7 @@ export async function mockInvoke<T>(cmd: string, args: Record<string, unknown> =
       now.cue.speaking = true;
       now.cue.label = label;
       emit();
-      // Fake a ~1.2s spoken length so the UI flips back automatically.
+      // Fake ~1.2s spoken length so the UI flips back.
       setTimeout(() => {
         now.cue.speaking = false;
         now.cue.label = null;

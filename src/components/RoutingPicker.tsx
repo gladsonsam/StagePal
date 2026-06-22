@@ -1,5 +1,4 @@
-// Shared stereo/mono channel-pair picker. Used by all three buses (pad/click/cue)
-// in Settings — extracted so adding another bus is one entry, not a copy/paste.
+// Shared stereo/mono channel-pair picker, used by all three buses in Settings.
 
 import { Eyebrow, Segmented, SelectField } from "./ui";
 
@@ -24,8 +23,7 @@ export function RoutingPicker({
     if (mode === "mono") {
       onChange(channelLeft, channelLeft);
     } else {
-      // Pick a sensible R that differs from L. Prefer L+1; fall back to L-1
-      // when L is already on the last channel of the device.
+      // R differs from L: prefer L+1, fall back to L-1 on the last channel.
       let r = channelLeft + 1;
       if (r >= channelCount) r = Math.max(0, channelLeft - 1);
       if (r === channelLeft) r = channelLeft; // 1-channel device: no real stereo

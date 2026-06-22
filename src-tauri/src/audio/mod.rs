@@ -1,4 +1,4 @@
-//! Real-time audio engine for looping worship pads with crossfade + channel routing.
+//! Real-time audio engine: looping pads, crossfade, channel routing.
 
 mod decode;
 mod engine;

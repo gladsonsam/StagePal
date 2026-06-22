@@ -29,10 +29,8 @@ interface RemoteState {
   conn: ConnState;
 }
 
-/**
- * One-stop subscription: fires /api/info once, then keeps a WebSocket open and
- * mirrors NowPlaying broadcasts into React state. Auto-reconnects on close.
- */
+// Fetches /api/info once, then mirrors NowPlaying WS broadcasts into state.
+// Auto-reconnects on close.
 export function useRemoteState(): RemoteState {
   const [info, setInfo] = useState<Info | null>(null);
   const [now, setNow] = useState<NowPlaying>(DEFAULT_NOW);
@@ -70,7 +68,7 @@ export function useRemoteState(): RemoteState {
         try {
           setNow(normalize(JSON.parse(e.data) as NowPlaying));
         } catch {
-          /* ignore malformed frames */
+          /* ignore malformed frame */
         }
       };
     };
@@ -86,7 +84,7 @@ export function useRemoteState(): RemoteState {
   return { info, now, conn };
 }
 
-/** Defensively backfill click/cue in case an older backend omits them. */
+/** Backfill click/cue in case an older backend omits them. */
 function normalize(n: NowPlaying): NowPlaying {
   let out = n;
   if (!out.click) out = { ...out, click: DEFAULT_NOW.click };

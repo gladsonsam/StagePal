@@ -1,4 +1,4 @@
-// Sidebar navigation entry — one row in the main shell's left rail.
+// Sidebar nav entry.
 
 import { Icon, type IconName } from "./ui";
 

@@ -1,13 +1,7 @@
 import { useEffect, useState } from "react";
 
-/**
- * Estimates `serverNow - clientNow` in ms by sampling /api/time a few times
- * and keeping the sample with the smallest round-trip — that minimizes the
- * uncertainty in pinning the server timestamp to the client clock.
- *
- * Without this, click beat-dots on the phone drift by whatever skew exists
- * between the device and the host (often hundreds of ms on mobile).
- */
+// Estimates serverNow - clientNow (ms) from /api/time, keeping the lowest-RTT
+// sample. Without it, phone beat-dots drift by device/host clock skew.
 export function useServerClockOffset(): number {
   const [offset, setOffset] = useState(0);
 
@@ -22,7 +16,7 @@ export function useServerClockOffset(): number {
         const serverNow = Number(await r.json());
         if (!Number.isFinite(serverNow)) return null;
         const rtt = t1 - t0;
-        // Assume the response was stamped roughly at the midpoint of the RTT.
+        // Assume the response was stamped at the RTT midpoint.
         return { offset: serverNow - (t0 + rtt / 2), rtt };
       } catch {
         return null;
@@ -40,8 +34,7 @@ export function useServerClockOffset(): number {
     };
 
     run();
-    // Resample on tab focus — phones routinely adjust their clocks and we
-    // don't want the dots to silently drift after a long suspend.
+    // Resample on focus — phones adjust clocks, drifting dots after suspend.
     const onFocus = () => {
       run();
     };

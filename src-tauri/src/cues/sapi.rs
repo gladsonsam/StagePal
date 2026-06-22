@@ -1,10 +1,7 @@
-//! Windows SAPI implementation via PowerShell + System.Speech.Synthesis.
+//! Windows SAPI impl via PowerShell + System.Speech.Synthesis.
 //!
-//! Why PowerShell instead of binding SAPI's COM directly? Zero new Rust deps,
-//! works on every stock Windows install (PowerShell + .NET are both shipped),
-//! and the call shape is dead-simple to reason about. The trait abstraction
-//! means we can swap to a `windows`-crate COM impl later without touching the
-//! audio engine or commands.
+//! PowerShell over COM: zero new deps, ships on every Windows. Trait lets us
+//! swap to a `windows`-crate COM impl later without touching the audio engine.
 
 use std::io::Write;
 use std::path::Path;
@@ -16,11 +13,10 @@ use std::os::windows::process::CommandExt;
 
 use super::synth::{Synthesizer, VoiceInfo};
 
-/// Generates collision-free temp filenames within a single process lifetime.
+/// Collision-free temp filenames within a process lifetime.
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Windows CREATE_NO_WINDOW — suppresses the console window that would
-/// otherwise flash when a GUI process spawns powershell.exe in release builds.
+/// CREATE_NO_WINDOW — stops a console flashing when GUI spawns powershell.exe.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -40,9 +36,7 @@ impl Default for SapiSynth {
 
 impl Synthesizer for SapiSynth {
     fn voices(&self) -> Result<Vec<VoiceInfo>, String> {
-        // ConvertTo-Json + ASCII output keeps parsing trivial. `-Compress` so
-        // the pipe stays single-line; ConvertTo-Json wraps a one-element array
-        // as a bare object, so we coerce via @() before JSON encoding.
+        // @() coerces a one-element result to an array (else JSON yields a bare object).
         let script = "Add-Type -AssemblyName System.Speech | Out-Null; \
             $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
             $voices = @($s.GetInstalledVoices() | ForEach-Object { \
@@ -70,9 +64,7 @@ impl Synthesizer for SapiSynth {
             return Err("nothing to speak".into());
         }
 
-        // Pipe the text in via stdin to dodge every PowerShell quoting pitfall
-        // (apostrophes, newlines, curly quotes, non-ASCII). The script reads
-        // stdin in full and feeds it to Speak().
+        // Text via stdin to dodge PowerShell quoting pitfalls (apostrophes, newlines, non-ASCII).
         let rate = rate.clamp(-10, 10);
         let out_path = ps_escape(&out.to_string_lossy());
         let voice_line = match voice {
@@ -98,23 +90,19 @@ impl Synthesizer for SapiSynth {
     }
 }
 
-/// Allocate a temp path for a freshly-rendered cue WAV. Caller is responsible
-/// for deletion once playback is done.
+/// Temp path for a rendered cue WAV. Caller deletes after playback.
 pub fn temp_wav_path() -> std::path::PathBuf {
     let pid = std::process::id();
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("stagepal-cue-{pid}-{n}.wav"))
 }
 
-/// Escape a string for embedding inside a PowerShell single-quoted literal.
-/// Inside '…' only the apostrophe itself is special — doubled to escape.
+/// Escape for a PowerShell single-quoted literal: double the apostrophe.
 fn ps_escape(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// Run a PowerShell script with no stdin and capture stdout. Errors carry
-/// stderr text so a misconfigured SAPI install (missing voices, perms) shows
-/// up in logs.
+/// Run a PowerShell script (no stdin), capture stdout. Errors carry stderr.
 fn run_ps(script: &str) -> Result<String, String> {
     let mut cmd = Command::new("powershell.exe");
     cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
@@ -136,8 +124,7 @@ fn run_ps(script: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Same as `run_ps` but writes `stdin_bytes` to the child's stdin. Used so
-/// arbitrary user text never needs quoting on the command line.
+/// Like `run_ps` but writes `stdin_bytes` to stdin, avoiding command-line quoting.
 fn run_ps_stdin(script: &str, stdin_bytes: &[u8]) -> Result<String, String> {
     let mut cmd = Command::new("powershell.exe");
     cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])

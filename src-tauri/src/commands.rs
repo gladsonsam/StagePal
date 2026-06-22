@@ -1,8 +1,6 @@
-//! Control surface for playback. The real work lives in `*_logic` free functions
-//! that take plain references, so both the Tauri commands (desktop UI) and the
-//! axum handlers (phone remote) drive identical behaviour.
-//!
-//! Every mutation persists settings and broadcasts NowPlaying to all clients.
+//! Playback control. `*_logic` free functions are shared by the Tauri commands
+//! (desktop) and axum handlers (phone remote). Each mutation persists and
+//! broadcasts NowPlaying.
 
 use std::path::PathBuf;
 
@@ -15,16 +13,12 @@ use crate::library;
 use crate::model::{now_unix_ms, Key, NowPlaying, Preset, QuickCue, Settings};
 use crate::state::CoreState;
 
-/// Wrapper around the active TTS synthesizer so it can be `manage()`'d as
-/// Tauri state. Trait-object so swapping in a non-SAPI backend is just a
-/// matter of constructing a different `Box<dyn Synthesizer>` at setup.
+/// TTS synthesizer as Tauri state. Trait-object so the backend can be swapped.
 pub struct CueSynth(pub Box<dyn Synthesizer>);
 
-// ---------------------------------------------------------------------------
-// Shared logic (used by both Tauri commands and the web server)
-// ---------------------------------------------------------------------------
+// --- Shared logic (Tauri commands + web server) ---
 
-/// Emit the current NowPlaying to the desktop window and the broadcast bus.
+/// Emit NowPlaying to the desktop window and the broadcast bus.
 pub fn emit_now(app: &AppHandle, core: &CoreState) {
     let now = core.snapshot();
     let _ = app.emit("now-playing", now.clone());
@@ -59,7 +53,7 @@ pub fn play_key_logic(
 ) -> Result<(), String> {
     let k = Key::parse(key).ok_or_else(|| format!("unknown key '{key}'"))?;
 
-    // Pressing the key that's already playing deselects it: fade out and stop.
+    // Re-pressing the playing key deselects it (fade out and stop).
     let already_playing = {
         let n = core.now.lock().unwrap();
         n.playing && n.key == Some(k)
@@ -88,11 +82,8 @@ pub fn play_key_logic(
     }
     emit_now(app, core);
 
-    // Auto-announce the new key. Best-effort: a synthesis hiccup mustn't
-    // surface as a failed key press. The phrase is short enough that a single
-    // letter at the saved rate flies past — render this one cue at a fixed
-    // slow rate (~-3) so "G" gets enough airtime to register, regardless of
-    // the user's saved rate for their own cues.
+    // Best-effort auto-announce; a synth hiccup mustn't fail the press. Fixed
+    // slow rate (-3) so a single letter gets enough airtime.
     if speak_key {
         let text = format!("Key of {}", k.spoken());
         if let Err(e) = cue_speak_logic(app, core, engine, synth, &text, None, Some(-3)) {
@@ -128,7 +119,7 @@ pub fn set_preset_logic(
     }
     core.save()?;
 
-    // If a key is playing, crossfade into the same key of the new sound.
+    // If a key is playing, crossfade into the same key of the new preset.
     let current_key = core.now.lock().unwrap().key;
     if let Some(k) = current_key {
         let path = {
@@ -151,9 +142,8 @@ pub fn set_crossfade_logic(core: &CoreState, engine: &AudioEngine, ms: u32) -> R
     core.save()
 }
 
-/// Assign (or move) an audio file to a key within a preset. If the key already
-/// held a file, that file returns to the preset's unmapped pile; if the incoming
-/// file was mapped to another key, it's moved (not duplicated).
+/// Assign (move) a file to a key. Any file already on the key returns to the
+/// unmapped pile; the incoming file is moved, not duplicated.
 pub fn assign_key_logic(
     core: &CoreState,
     preset_id: &str,
@@ -172,7 +162,7 @@ pub fn assign_key_logic(
         preset.unmapped.retain(|p| p != &path);
         preset.files.retain(|_, v| v != &path);
 
-        // Park any file previously on this key back in the unmapped pile.
+        // Park the key's previous file back in the unmapped pile.
         if let Some(prev) = preset.files.insert(key, path) {
             if !preset.unmapped.contains(&prev) {
                 preset.unmapped.push(prev);
@@ -183,7 +173,7 @@ pub fn assign_key_logic(
     core.save()
 }
 
-/// Unassign a key, returning its file (if any) to the unmapped pile.
+/// Unassign a key, returning its file to the unmapped pile.
 pub fn clear_key_logic(core: &CoreState, preset_id: &str, key: Key) -> Result<(), String> {
     {
         let mut s = core.settings.lock().unwrap();
@@ -215,11 +205,9 @@ pub struct Info {
     pub presets: Vec<PresetBrief>,
     pub active_preset: Option<String>,
     pub mapped_keys: Vec<String>,
-    /// Active preset's key → file name (just the file name, no path), so the
-    /// phone remote can label each pad like the desktop does.
+    /// Key → file name (no path), so the phone can label each pad.
     pub files: std::collections::HashMap<String, String>,
-    /// Saved quick cues, so the phone can render its button grid from a
-    /// single fetch instead of /api/info + /api/cues.
+    /// Saved quick cues, so the phone renders its grid from one fetch.
     pub cues_quick: Vec<QuickCue>,
     pub now: NowPlaying,
 }
@@ -265,9 +253,7 @@ pub fn build_info(core: &CoreState) -> Info {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tauri command wrappers (desktop UI)
-// ---------------------------------------------------------------------------
+// --- Tauri command wrappers (desktop UI) ---
 
 #[tauri::command]
 pub fn get_settings(core: State<'_, CoreState>) -> Settings {
@@ -293,13 +279,9 @@ pub fn set_audio_output(
     channel_left: usize,
     channel_right: usize,
 ) -> Result<(), String> {
-    // Resolve the full pad/click/cue routing to apply. Two cases:
-    //   - Switching to a different device: if we've used this device before,
-    //     restore the channels saved for it (so it doesn't snap back to 1/2);
-    //     otherwise fall back to the requested pad pair plus the current
-    //     click/cue pairs as a starting point.
-    //   - Editing the pad channels on the current device: honour the requested
-    //     pad pair and leave click/cue untouched.
+    // Resolve pad/click/cue routing. Switching devices restores that device's
+    // saved channels (else requested pad pair + current click/cue); editing
+    // the current device honours the requested pad pair, leaving click/cue.
     let ((pad_l, pad_r), (click_l, click_r), (cue_l, cue_r)) = {
         let s = core.settings.lock().unwrap();
         let switching =
@@ -339,7 +321,7 @@ pub fn set_audio_output(
         s.click.channel_right = click_r;
         s.cues.channel_left = cue_l;
         s.cues.channel_right = cue_r;
-        // Remember this routing for the device so reselecting it restores it.
+        // Remember this routing so reselecting the device restores it.
         s.remember_current_route();
     }
     core.save()
@@ -366,11 +348,9 @@ pub fn scan_library(
     folder: String,
     name: Option<String>,
 ) -> Result<Preset, String> {
-    // Preset id is just the folder path, so we can look up the existing entry
-    // without scanning the folder first. The filesystem scan runs OUTSIDE the
-    // Settings lock so other commands (assign_key, rename_preset, …) aren't
-    // blocked on it; the in-memory merge with manual mappings happens under
-    // the lock so concurrent edits during the scan aren't clobbered.
+    // Preset id is the folder path. Scan runs OUTSIDE the Settings lock so
+    // other commands aren't blocked; the merge happens under the lock so
+    // concurrent edits during the scan aren't clobbered.
     let folder_path = std::path::PathBuf::from(&folder);
     let id = folder_path.to_string_lossy().to_string();
 
@@ -388,9 +368,7 @@ pub fn scan_library(
     let preset = {
         let mut s = core.settings.lock().unwrap();
         let merged = match s.presets.iter().find(|p| p.id == id) {
-            // Merge against the LATEST snapshot (post any mid-scan edits)
-            // rather than a stale clone — manual assignments made during the
-            // scan survive.
+            // Merge against the latest snapshot so mid-scan edits survive.
             Some(current) => library::merge_scan(current, fresh),
             None => fresh,
         };
@@ -508,9 +486,7 @@ pub fn server_url(core: State<'_, CoreState>) -> ServerUrl {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Click track
-// ---------------------------------------------------------------------------
+// --- Click track ---
 
 pub fn set_click_enabled_logic(
     app: &AppHandle,
@@ -560,8 +536,7 @@ pub fn set_click_beats_logic(
     {
         let mut n = core.now.lock().unwrap();
         n.click.beats_per_bar = beats;
-        // Realign the visual cycle to the new signature so clients restart
-        // from beat 1 on the next predicted tick.
+        // Realign so clients restart from beat 1 on the next tick.
         if n.click.enabled {
             n.click.started_at_ms = Some(now_unix_ms());
         }
@@ -679,17 +654,11 @@ pub fn set_click_channels(
     set_click_channels_logic(core.inner(), engine.inner(), channel_left, channel_right)
 }
 
-// ---------------------------------------------------------------------------
-// Cues (TTS)
-// ---------------------------------------------------------------------------
+// --- Cues (TTS) ---
 
-/// Render the given text to a temp WAV and ask the audio engine to play it on
-/// the cue bus. Sets `now.cue.speaking = true` synchronously so the UI flips
-/// the moment the user taps; the matching `false` flip arrives via the
-/// engine's `CueEnded` event (see lib.rs setup).
-///
-/// `rate_override` bypasses the user's saved cue rate — used by the auto
-/// key-announcement so the short phrase doesn't fly past.
+/// Render text to a temp WAV and play it on the cue bus. Sets `speaking = true`
+/// synchronously; the `false` flip arrives via the engine's `CueEnded` event.
+/// `rate_override` bypasses the saved cue rate (used by auto key-announce).
 pub fn cue_speak_logic(
     app: &AppHandle,
     core: &CoreState,
@@ -754,8 +723,7 @@ pub fn cue_speak_quick_logic(
     cue_speak_logic(app, core, engine, synth, &cue.text, Some(cue.label), None)
 }
 
-/// Mint a short opaque id from the current time so quick cues survive
-/// rename/edit without breaking phone references.
+/// Short opaque id from the clock, stable across rename/edit.
 fn new_cue_id() -> String {
     let n = now_unix_ms();
     format!("q-{n:x}")
@@ -811,8 +779,7 @@ pub fn cue_remove_logic(core: &CoreState, id: &str) -> Result<(), String> {
     core.save()
 }
 
-/// Move the cue with `id` to `to_index`. Indexes past the end clamp to the
-/// end; negative not handled (caller uses usize).
+/// Move cue `id` to `to_index` (clamped to the end).
 pub fn cue_move_logic(core: &CoreState, id: &str, to_index: usize) -> Result<(), String> {
     {
         let mut s = core.settings.lock().unwrap();

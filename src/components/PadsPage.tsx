@@ -1,5 +1,4 @@
 // Pads page — pick a chord, set master volume, big stop button.
-// Lives on its own so the App shell stays a routing/state container.
 
 import {
   playKey,

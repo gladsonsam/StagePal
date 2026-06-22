@@ -1,5 +1,5 @@
 //! Shared core state: persisted settings + live "now playing", plus a broadcast
-//! bus so every client (desktop UI and connected phones) sees state changes.
+//! bus so all clients (desktop + phones) see state changes.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -11,13 +11,13 @@ use crate::model::{ClickNow, CueNow, NowPlaying, Settings};
 pub struct CoreState {
     pub settings: Mutex<Settings>,
     pub now: Mutex<NowPlaying>,
-    /// Broadcast of NowPlaying snapshots, consumed by the phone WebSocket.
+    /// NowPlaying snapshots, consumed by the phone WebSocket.
     pub tx: broadcast::Sender<NowPlaying>,
     config_path: PathBuf,
 }
 
 impl CoreState {
-    /// Load settings from `config_path` (or defaults if missing/corrupt).
+    /// Load settings, or defaults if missing/corrupt.
     pub fn load(config_path: PathBuf) -> Self {
         let settings = std::fs::read_to_string(&config_path)
             .ok()
@@ -49,7 +49,7 @@ impl CoreState {
         }
     }
 
-    /// Persist the current settings to disk.
+    /// Persist settings to disk.
     pub fn save(&self) -> Result<(), String> {
         let settings = self.settings.lock().unwrap();
         if let Some(dir) = self.config_path.parent() {
@@ -59,7 +59,7 @@ impl CoreState {
         std::fs::write(&self.config_path, json).map_err(|e| format!("write settings: {e}"))
     }
 
-    /// Clone of the current live playback state.
+    /// Clone of live playback state.
     pub fn snapshot(&self) -> NowPlaying {
         self.now.lock().unwrap().clone()
     }

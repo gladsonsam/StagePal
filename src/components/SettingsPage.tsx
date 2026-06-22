@@ -1,6 +1,5 @@
-// Settings page — output device, three bus routings (pad/click/cue),
-// crossfade duration, and the duck-click toggle. Each card is a self-contained
-// concern; adding a fourth bus is one more card.
+// Settings page — output device, bus routings (pad/click/cue), crossfade,
+// duck-click toggle.
 
 import { useState } from "react";
 import {
@@ -25,8 +24,7 @@ interface Props {
   refreshSettings: () => Promise<void>;
 }
 
-// Stable composite value so the device dropdown can disambiguate same-named
-// drivers that exist on both WASAPI and ASIO (e.g. some USB interfaces).
+// Composite key so the dropdown disambiguates same-named WASAPI/ASIO drivers.
 const DEVICE_SEP = "|>|";
 const deviceKey = (host: string, name: string): string =>
   host + DEVICE_SEP + name;
@@ -79,9 +77,8 @@ export function SettingsPage({
           onChange={(v) =>
             guard(async () => {
               const [host, name] = splitDeviceKey(v);
-              // The backend restores this device's saved routing if we've used
-              // it before; the 1/2 pad pair here is only the fallback for a
-              // device seen for the first time.
+              // Backend restores saved routing if known; 0/1 is the fallback
+              // for a first-seen device.
               await setAudioOutput(host, name, 0, 1);
               await refreshSettings();
             })

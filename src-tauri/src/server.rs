@@ -1,6 +1,6 @@
-//! Embedded web server: serves the phone remote and exposes REST + WebSocket
-//! endpoints that drive the same playback logic as the desktop UI. Advertised
-//! on the LAN via mDNS so phones can use `http://<host>.local:<port>`.
+//! Embedded web server: serves the phone remote and REST + WebSocket endpoints
+//! driving the same playback logic as the desktop UI. Advertised on the LAN via
+//! mDNS as `http://<host>.local:<port>`.
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 
@@ -26,8 +26,7 @@ use crate::state::CoreState;
 
 const REMOTE_HTML: &str = include_str!("../assets/remote.html");
 
-/// Best-effort primary LAN IPv4 (via the "connect a UDP socket" trick; no
-/// packets are actually sent).
+/// Best-effort primary LAN IPv4 via the UDP-connect trick (no packets sent).
 pub fn local_ipv4() -> Option<Ipv4Addr> {
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("8.8.8.8:80").ok()?;
@@ -37,7 +36,7 @@ pub fn local_ipv4() -> Option<Ipv4Addr> {
     }
 }
 
-/// Machine hostname (lowercased) used for the `.local` mDNS name.
+/// Lowercased hostname for the `.local` mDNS name.
 pub fn mdns_host() -> String {
     std::env::var("COMPUTERNAME")
         .ok()
@@ -114,7 +113,7 @@ fn advertise_mdns(port: u16) {
             } else {
                 eprintln!("[mdns] advertising http://{host}.local:{port}");
             }
-            // Keep the daemon (and its background thread) alive for the app's life.
+            // Keep the daemon alive for the app's life.
             std::mem::forget(daemon);
         }
         Err(e) => eprintln!("[mdns] service info: {e}"),
@@ -128,12 +127,9 @@ fn map_result(r: Result<(), String>) -> Response {
     }
 }
 
-/// Run a sync command on the blocking pool so it doesn't pin a tokio worker.
-/// Cue synthesis shells out to PowerShell (hundreds of ms) and most other
-/// commands call `core.save()` (synchronous `std::fs::write` of settings),
-/// either of which under load would otherwise starve the WebSocket and HTTP
-/// handlers. Applied to every handler that mutates state — only `info`,
-/// `time`, and `state_handler` (pure reads) run directly on the tokio worker.
+/// Run a blocking command off the tokio workers. Cue synthesis (PowerShell) and
+/// `core.save()` (sync fs writes) would otherwise starve the HTTP/WebSocket
+/// handlers. Used by every mutating handler; pure reads run on the worker directly.
 async fn run_blocking<F>(f: F) -> Result<(), String>
 where
     F: FnOnce() -> Result<(), String> + Send + 'static,
@@ -148,9 +144,8 @@ async fn info(State(app): State<AppHandle>) -> impl IntoResponse {
     Json(commands::build_info(core.inner()))
 }
 
-/// Returns the server's wall-clock unix ms. Remote clients sample this to
-/// estimate the offset between their device clock and the server clock so the
-/// click beat-dots line up with the audio (which uses server time stamps).
+/// Server wall-clock unix ms. Clients sample it to estimate clock offset so the
+/// click beat-dots line up with audio (which uses server timestamps).
 async fn time() -> impl IntoResponse {
     Json(now_unix_ms())
 }
@@ -320,10 +315,9 @@ async fn cue_stop(State(app): State<AppHandle>) -> Response {
     map_result(r)
 }
 
-/// Universal sync endpoint for external controllers (e.g. FreeShow actions).
-/// All fields are optional — send any subset and only those are applied.
-/// Numeric fields accept both JSON numbers and quoted strings ("120" or 120)
-/// because some emitters (e.g. FreeShow message templates) always produce strings.
+/// Universal sync endpoint for external controllers (e.g. FreeShow). All fields
+/// optional; only those sent are applied. Numeric fields accept JSON numbers or
+/// quoted strings, since some emitters always produce strings.
 ///
 /// ```json
 /// { "key": "G", "bpm": 120, "beats": 4 }
@@ -447,7 +441,7 @@ async fn ws_loop(mut socket: WebSocket, app: AppHandle) {
                 Err(RecvError::Closed) => break,
             },
             msg = socket.recv() => match msg {
-                Some(Ok(_)) => {} // ignore inbound messages
+                Some(Ok(_)) => {} // ignore inbound
                 _ => break,
             },
         }

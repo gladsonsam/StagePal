@@ -1,7 +1,6 @@
 // Phone Cues tab — quick-cue button grid + collapsible type-to-speak.
-// Optimized for a musician on stage: huge tap targets, the speaking button
-// pulses so you can see at a glance what's running, and STOP CUE pins to the
-// bottom only while audio is live (matches the pad transport pattern).
+// Big tap targets; the speaking button pulses; Stop pins to the bottom only
+// while live.
 
 import { useState } from "react";
 import type { NowPlaying } from "../../shared/types";

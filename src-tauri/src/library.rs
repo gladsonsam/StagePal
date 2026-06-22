@@ -1,15 +1,9 @@
 //! Scans a folder of pad audio files and maps them to musical keys.
 //!
-//! Recognises common worship-pad naming: "C.mp3", "C#.wav", "C Pad.mp3",
-//! "Pad C.flac", "01 - C.mp3". Matching is by whole filename token, so a token
-//! must be exactly a key spelling (sharp or flat).
-//!
-//! Two situations need human help, and both feed the conflict-resolution UI:
-//!   - a file whose key can't be determined at all, and
-//!   - two or more files that claim the *same* key (a conflict).
-//!
-//! In both cases the affected files land in `Preset::unmapped` rather than being
-//! silently dropped, so the user can assign them to a key by hand.
+//! Matches by whole filename token (e.g. "C.mp3", "Pad C.flac", "01 - C.mp3");
+//! a token must be exactly a key spelling. Files with no key or a same-key
+//! conflict go to `Preset::unmapped` for manual resolution instead of being
+//! dropped.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,7 +19,7 @@ fn has_audio_ext(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Split a filename stem into tokens and return the first that names a key.
+/// First filename-stem token that names a key.
 fn key_from_filename(path: &Path) -> Option<Key> {
     let stem = path.file_stem()?.to_str()?.to_lowercase();
     stem.split(|c: char| !(c.is_ascii_alphanumeric() || c == '#'))
@@ -33,8 +27,7 @@ fn key_from_filename(path: &Path) -> Option<Key> {
         .find_map(Key::parse)
 }
 
-/// List the audio files in `folder`, sorted, returning a friendly error if the
-/// folder can't be read.
+/// Sorted audio files in `folder`.
 fn audio_files(folder: &Path) -> Result<Vec<PathBuf>, String> {
     if !folder.is_dir() {
         return Err(format!("not a folder: {}", folder.display()));
@@ -56,14 +49,12 @@ fn folder_display_name(folder: &Path) -> String {
         .to_string()
 }
 
-/// Scan `folder`, auto-mapping confidently-named files to keys. A key claimed by
-/// exactly one file is auto-assigned; anything ambiguous (no key, or a same-key
-/// conflict) goes to `unmapped` for manual resolution. `name` overrides the
-/// display name (defaults to the folder name).
+/// Scan `folder`: keys claimed by exactly one file are auto-assigned; ambiguous
+/// files go to `unmapped`. `name` overrides the display name (default: folder name).
 pub fn scan_preset(folder: &Path, name: Option<String>) -> Result<Preset, String> {
     let paths = audio_files(folder)?;
 
-    // Group every candidate file by the key its name implies.
+    // Group files by the key their name implies.
     let mut by_key: HashMap<Key, Vec<PathBuf>> = HashMap::new();
     let mut unmapped: Vec<PathBuf> = Vec::new();
     for path in paths {
@@ -73,8 +64,7 @@ pub fn scan_preset(folder: &Path, name: Option<String>) -> Result<Preset, String
         }
     }
 
-    // A key with one claimant is auto-assigned; conflicts go to `unmapped` so the
-    // user resolves them explicitly rather than us guessing.
+    // One claimant → auto-assign; conflicts → `unmapped`.
     let mut files: HashMap<Key, PathBuf> = HashMap::new();
     for (key, mut candidates) in by_key {
         if candidates.len() == 1 {
@@ -94,20 +84,18 @@ pub fn scan_preset(folder: &Path, name: Option<String>) -> Result<Preset, String
     })
 }
 
-/// Re-scan an existing preset's folder, preserving the manual key assignments the
-/// user has already made. Manual choices win; only files that still exist on disk
-/// are kept, and anything new-but-ambiguous lands in `unmapped`.
+/// Re-scan a preset's folder, preserving the user's manual key assignments.
+/// Manual choices win; only files still on disk are kept.
 pub fn rescan_preserving(old: &Preset, name: Option<String>) -> Result<Preset, String> {
     let fresh = scan_preset(&old.folder, name.or_else(|| Some(old.name.clone())))?;
     Ok(merge_scan(old, fresh))
 }
 
-/// Pure in-memory merge of a freshly-scanned preset onto an existing one's
-/// manual mappings. Split from `rescan_preserving` so callers can run the
-/// slow filesystem scan outside their settings lock and then reconcile
-/// against the (possibly concurrently-mutated) live state under the lock.
+/// In-memory merge of a fresh scan onto an existing preset's manual mappings.
+/// Split from `rescan_preserving` so the slow scan can run outside the settings
+/// lock, then reconcile against live state under the lock.
 pub fn merge_scan(old: &Preset, fresh: Preset) -> Preset {
-    // The full set of audio files currently on disk.
+    // All audio files currently on disk.
     let universe: Vec<PathBuf> = fresh
         .files
         .values()
@@ -115,7 +103,7 @@ pub fn merge_scan(old: &Preset, fresh: Preset) -> Preset {
         .chain(fresh.unmapped.iter().cloned())
         .collect();
 
-    // Start from the fresh auto-mapping, then let surviving manual choices override.
+    // Fresh auto-mapping, overridden by surviving manual choices.
     let mut files = fresh.files;
     for (key, path) in &old.files {
         if universe.contains(path) {
@@ -123,7 +111,7 @@ pub fn merge_scan(old: &Preset, fresh: Preset) -> Preset {
         }
     }
 
-    // Whatever isn't assigned to a key is unmapped.
+    // Unassigned files are unmapped.
     let mut unmapped: Vec<PathBuf> = universe
         .into_iter()
         .filter(|p| !files.values().any(|v| v == p))

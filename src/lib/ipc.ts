@@ -1,14 +1,11 @@
-// Typed wrappers over the Tauri backend commands + the now-playing event.
-// One place for invoke() names and argument shapes.
+// Typed wrappers over the Tauri backend commands + now-playing event.
 
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { Key, NowPlaying } from "../shared/types";
 
-// In a dev build running outside Tauri (a plain browser), fall back to an
-// in-memory mock so the UI is fully explorable. Production builds always run
-// inside Tauri, where `import.meta.env.DEV` is false and this whole branch (and
-// the dynamically-imported mock) is dropped from the bundle.
+// Dev build outside Tauri (plain browser): use the in-memory mock. Dropped from
+// production bundles where import.meta.env.DEV is false.
 const inTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const useMock = import.meta.env.DEV && !inTauri;
@@ -24,7 +21,7 @@ export { ALL_KEYS } from "../shared/types";
 export type { Key, ClickNow, CueNow, NowPlaying } from "../shared/types";
 
 export interface DeviceInfo {
-  /** cpal host label, e.g. "WASAPI" or "ASIO". */
+  /** cpal host, e.g. "WASAPI" or "ASIO". */
   host: string;
   name: string;
   channels: number;
@@ -51,7 +48,7 @@ export interface Preset {
   folder: string;
   /** Key (e.g. "C#") → file path. */
   files: Partial<Record<Key, string>>;
-  /** Audio files whose key couldn't be auto-detected — awaiting manual mapping. */
+  /** Files whose key couldn't be auto-detected — awaiting manual mapping. */
   unmapped: string[];
 }
 
@@ -77,7 +74,7 @@ export interface CueSettings {
   channel_left: number;
   channel_right: number;
   duck_click: boolean;
-  /** Speak "Key of X" automatically whenever a pad changes. */
+  /** Speak "Key of X" whenever a pad changes. */
   speak_key_on_change: boolean;
   quick: QuickCue[];
 }
@@ -178,7 +175,7 @@ export interface VoiceInfo {
 
 export const listVoices = () => invoke<VoiceInfo[]>("list_voices");
 
-/** Speak free-form text. Renders TTS to a temp WAV then plays it on the cue bus. */
+/** Speak free-form text on the cue bus. */
 export const cueSpeak = (text: string) => invoke<void>("cue_speak", { text });
 
 /** Speak a saved quick cue by id. */

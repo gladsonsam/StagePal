@@ -1,12 +1,10 @@
-// Design-system building blocks ported from the Claude Design handoff.
-// Visuals come from CSS tokens in App.css; these components add structure,
-// state, and real interactivity.
+// Design-system building blocks. Visuals come from CSS tokens in App.css.
 
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { useHoldRepeat } from "../shared/useHoldRepeat";
 
-/* ── line icons (1.6 stroke, 20×20 viewbox) ───────────────────────── */
+// line icons (1.6 stroke, 20×20 viewbox)
 export type IconName =
   | "chevron"
   | "chevronR"
@@ -163,7 +161,7 @@ export function Icon({
   );
 }
 
-/* ── brand mark: rounded tile + still-water wave ──────────────────── */
+// brand mark: rounded tile + wave
 export function Mark({ size = 34 }: { size?: number }) {
   const rad = size * 0.28;
   return (
@@ -204,7 +202,7 @@ export function Mark({ size = 34 }: { size?: number }) {
   );
 }
 
-/* ── ambient level meter (calm vertical bars) ─────────────────────── */
+// level meter (vertical bars)
 export function Meter({
   live,
   bars = 7,
@@ -256,7 +254,7 @@ export function Card({
   );
 }
 
-/* ── select-style field ───────────────────────────────────────────── */
+// select field
 export function SelectField({
   label,
   value,
@@ -306,7 +304,7 @@ export function SelectField({
   );
 }
 
-/* ── segmented toggle ─────────────────────────────────────────────── */
+// segmented toggle
 export function Segmented<T extends string>({
   value,
   options,
@@ -343,7 +341,7 @@ export function Segmented<T extends string>({
   );
 }
 
-/* ── volume (icon + range + numeric) ──────────────────────────────── */
+// volume (icon + range + numeric)
 export function Volume({
   value,
   onChange,
@@ -370,7 +368,7 @@ export function Volume({
   );
 }
 
-/* ── bare slider (no icon / no readout) — crossfade ───────────────── */
+// bare slider (no icon / no readout)
 export function Slider({
   value,
   min = 0,
@@ -399,7 +397,7 @@ export function Slider({
   );
 }
 
-/* ── pad cluster (grid or piano) ──────────────────────────────────── */
+// pad cluster (grid or piano)
 export const NOTES = [
   "C",
   "C#",
@@ -471,9 +469,7 @@ export function PadCluster({
   );
 }
 
-/* ── click: BPM display + steppers ─────────────────────────────────── */
-// Steppers: tap = ±1, hold = auto-repeat with acceleration.
-// Number: click to edit; Enter/blur commits, Esc cancels.
+// BPM display: steppers (tap ±1, hold to ramp); click number to edit.
 export function BpmDisplay({
   value,
   onChange,
@@ -571,7 +567,7 @@ export function BpmDisplay({
   );
 }
 
-/* ── click: beat dots, predict locally from started_at + bpm ──────── */
+// beat dots: predicted locally from started_at + bpm
 export function BeatDots({
   beatsPerBar,
   bpm,
@@ -580,7 +576,7 @@ export function BeatDots({
 }: {
   beatsPerBar: number;
   bpm: number;
-  /** Wall-clock unix ms when the click was last (re)started; null when off. */
+  /** unix ms when click last (re)started; null when off. */
   startedAtMs: number | null;
   size?: number;
 }) {
@@ -590,9 +586,7 @@ export function BeatDots({
       setTick(0);
       return;
     }
-    // setInterval, not requestAnimationFrame: RAF is suspended in background
-    // tabs and headless browsers (which leaves the dots frozen). 50 ms is
-    // smooth enough for a 4-dot indicator and costs near-nothing.
+    // setInterval, not RAF: RAF is suspended in background tabs, freezing the dots.
     const id = window.setInterval(() => setTick((t) => t + 1), 50);
     return () => window.clearInterval(id);
   }, [startedAtMs]);
@@ -602,7 +596,7 @@ export function BeatDots({
     ? Math.floor(((Date.now() - startedAtMs) * bpm) / 60_000) % beatsPerBar
     : -1;
 
-  // touch `tick` so React keeps re-rendering during animation
+  // touch `tick` to keep re-rendering during animation
   void tick;
 
   return (
@@ -618,17 +612,12 @@ export function BeatDots({
   );
 }
 
-/* ── click: tap-tempo button ──────────────────────────────────────── */
-/**
- * Maintains a rolling window of recent tap timestamps and reports a fresh BPM
- * once we have ≥2 taps. A gap of >2 s resets the window (treated as a new
- * attempt). Caller is responsible for actually committing the BPM upstream.
- */
+// tap-tempo: rolling tap window → BPM after ≥2 taps; >2s gap resets.
 export function TapButton({
   onTap,
   big = false,
 }: {
-  /** Called with the latest median-derived BPM, after the 2nd tap onward. */
+  /** Called with the median-derived BPM, from the 2nd tap onward. */
   onTap: (bpm: number) => void;
   big?: boolean;
 }) {

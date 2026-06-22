@@ -1,19 +1,6 @@
-// Press-and-hold stepper with auto-repeat + acceleration.
-//
-// One handler bundle per +/− button. Spread the result onto the button.
-// On tap (or keyboard Space/Enter), `apply(value + step)` fires once. On
-// press-and-hold, the same target accumulates and auto-repeats, speeding up
-// over time.
-//
-// The hook owns the start-anchor snapshot so the consumer doesn't have to
-// maintain a `valueRef` mirror per button — the previous shape pushed that
-// responsibility onto callers and led to (a) a single `startRef` shared
-// across +/− that multi-touch could corrupt, and (b) rapid taps within a
-// network RTT all snapshotting the same stale value (so the target never
-// accumulated). Both are gone now: every `useHoldRepeat` instance has its
-// own start ref, and consecutive taps within `coalesceWindow` reuse the
-// last-sent target as the anchor so multi-tap accumulation works even
-// before the upstream value catches up.
+// Press-and-hold stepper with auto-repeat + acceleration. Each instance owns
+// its own start anchor; taps within coalesceWindow accumulate off the last-sent
+// target so multi-tap works before the upstream value catches up.
 
 import type { KeyboardEvent, MouseEvent, PointerEvent } from "react";
 import { useEffect, useRef } from "react";
@@ -24,12 +11,7 @@ interface HoldRepeatCfg {
   minInterval?: number;
   speedupAfter?: number;
   speedupFactor?: number;
-  /**
-   * If a new tap arrives within this many ms of the last applied step, it
-   * accumulates on top of the last-applied target rather than re-anchoring
-   * to `value`. Lets three rapid taps actually move BPM by 3, even when the
-   * upstream WebSocket hasn't echoed back the first one yet.
-   */
+  /** Taps within this many ms accumulate off the last target, not `value`. */
   coalesceWindow?: number;
 }
 
@@ -39,17 +21,13 @@ interface HoldRepeatProps {
   onPointerUp: () => void;
   onPointerLeave: () => void;
   onPointerCancel: () => void;
-  /** Keyboard activation (Space/Enter on focused <button>) → single step. */
+  /** Keyboard activation (Space/Enter) → single step. */
   onClick: (e: MouseEvent<HTMLElement>) => void;
-  /** Optional: lets parent extend the keyboard story (e.g. arrow keys). */
+  /** Optional: lets parent add keyboard handling (e.g. arrow keys). */
   onKeyDown?: (e: KeyboardEvent<HTMLElement>) => void;
 }
 
-/**
- * @param value the current authoritative value (e.g. the BPM prop from props)
- * @param step  signed increment per tick — pass +1 for the "plus" button, -1 for "minus"
- * @param apply called with the next target value (already advanced by `step` * n)
- */
+/** `step`: +1 for plus, -1 for minus. `apply`: receives the next target. */
 export function useHoldRepeat(
   value: number,
   step: number,
@@ -65,16 +43,14 @@ export function useHoldRepeat(
     coalesceWindow = 1500,
   } = cfg;
 
-  // Mirror the latest prop so the timer callback (which closes over its
-  // first-render snapshot) can read the current value at tick time.
+  // Mirror latest prop so the timer callback reads the current value at tick time.
   const valueRef = useRef(value);
   valueRef.current = value;
   const applyRef = useRef(apply);
   applyRef.current = apply;
 
   const timerRef = useRef<number | null>(null);
-  // Last target we asked the consumer to apply; used as the anchor when a
-  // follow-up tap arrives before `value` has caught up.
+  // Last applied target; anchor for a follow-up tap before `value` catches up.
   const lastTargetRef = useRef<number | null>(null);
   const lastTargetAtRef = useRef(0);
 
@@ -90,8 +66,7 @@ export function useHoldRepeat(
   const nowMs = () =>
     typeof performance !== "undefined" ? performance.now() : Date.now();
 
-  // Pick the anchor for a new session: either the last target (if a recent
-  // tap is still pending) or the current authoritative value.
+  // Anchor: last target if a recent tap is pending, else current value.
   const anchor = (): number => {
     const t = lastTargetRef.current;
     if (t != null && nowMs() - lastTargetAtRef.current < coalesceWindow) {
@@ -132,8 +107,7 @@ export function useHoldRepeat(
 
   return {
     onPointerDown: (e) => {
-      // Reject non-primary mouse buttons; let touch/pen through (their
-      // synthesized button is also 0).
+      // Reject non-primary mouse buttons; let touch/pen through (button is 0).
       if (e.pointerType === "mouse" && e.button !== 0) return;
       e.preventDefault();
       e.currentTarget.setPointerCapture?.(e.pointerId);
@@ -142,9 +116,8 @@ export function useHoldRepeat(
     onPointerUp: stop,
     onPointerLeave: stop,
     onPointerCancel: stop,
-    // Keyboard-synthesized click on a <button>: detail === 0. Real pointer
-    // clicks have detail >= 1 and have already been handled by pointerdown,
-    // so this branch only fires for Space/Enter activation.
+    // detail === 0 means keyboard activation; pointer clicks (detail >= 1) are
+    // already handled by pointerdown.
     onClick: (e) => {
       if (e.detail === 0) oneStep();
     },

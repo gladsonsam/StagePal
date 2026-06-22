@@ -1,5 +1,4 @@
-//! Core data types shared across the app: musical keys, pad presets, persisted
-//! settings, and the live "now playing" state broadcast to all clients.
+//! Core shared types: keys, presets, settings, and live NowPlaying state.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -7,8 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-/// Wall-clock unix-epoch milliseconds. Used so connected clients can predict
-/// the current click beat locally without a per-beat broadcast.
+/// Unix-epoch millis, so clients predict the click beat without a per-beat broadcast.
 pub fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -16,7 +14,7 @@ pub fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The 12 chromatic roots. Designed to extend later with major/minor quality.
+/// The 12 chromatic roots.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Key {
     #[serde(rename = "C")]
@@ -79,7 +77,7 @@ impl Key {
         }
     }
 
-    /// TTS-friendly spelling — SAPI says "#" as "hash", so spell sharps out.
+    /// TTS spelling — SAPI reads "#" as "hash", so spell sharps out.
     pub fn spoken(self) -> &'static str {
         match self {
             Key::C => "C",
@@ -97,14 +95,13 @@ impl Key {
         }
     }
 
-    /// Parse a key from an API/UI string (accepts sharps and flats).
+    /// Parse a key from an API/UI string (sharps and flats).
     pub fn parse(s: &str) -> Option<Key> {
         let norm = s.trim().to_lowercase();
         Key::ALL.into_iter().find(|k| k.aliases().contains(&norm.as_str()))
     }
 
-    /// Lowercase spellings used to recognise this key in a filename stem.
-    /// Includes sharp, flat, and "sharp"/"flat" word forms.
+    /// Lowercase spellings to recognise this key in a filename stem.
     pub fn aliases(self) -> &'static [&'static str] {
         match self {
             Key::C => &["c"],
@@ -123,7 +120,7 @@ impl Key {
     }
 }
 
-/// A set of pad files (one per key) living in one folder.
+/// A set of pad files (one per key) in one folder.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Preset {
     pub id: String,
@@ -131,17 +128,14 @@ pub struct Preset {
     pub folder: PathBuf,
     /// Key → audio file path. May be missing some keys.
     pub files: HashMap<Key, PathBuf>,
-    /// Audio files found in the folder whose key could not be determined
-    /// automatically (or that lost a same-key conflict). Surfaced to the UI so
-    /// the user can assign them to a key by hand. `#[serde(default)]` keeps old
-    /// settings files (written before this field existed) loadable.
+    /// Files whose key couldn't be auto-determined (or lost a conflict), for
+    /// manual assignment. `serde(default)` keeps pre-field settings loadable.
     #[serde(default)]
     pub unmapped: Vec<PathBuf>,
 }
 
-/// Saved pad/click/cue channel routing for one output device. Remembered per
-/// device so returning to a previously-used interface restores the exact
-/// channels you last picked there instead of snapping back to 1/2.
+/// Saved pad/click/cue routing for one device, so reselecting it restores the
+/// channels last picked instead of snapping back to 1/2.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct DeviceRoute {
     pub pad_left: usize,
@@ -155,8 +149,7 @@ pub struct DeviceRoute {
 /// Persisted application settings.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
-    /// cpal host label ("WASAPI" or "ASIO"). Defaulted to WASAPI on Windows so
-    /// older settings files (written before ASIO support) keep working.
+    /// cpal host label ("WASAPI" or "ASIO"). Defaults to WASAPI for pre-ASIO settings.
     #[serde(default = "default_host")]
     pub output_host: String,
     pub output_device: Option<String>,
@@ -167,23 +160,19 @@ pub struct Settings {
     pub presets: Vec<Preset>,
     pub active_preset: Option<String>,
     pub server_port: u16,
-    /// Click-track config. `#[serde(default)]` keeps settings files written
-    /// before the click feature loadable.
+    /// Click-track config. `serde(default)` keeps pre-click settings loadable.
     #[serde(default)]
     pub click: ClickSettings,
-    /// TTS cue config. `#[serde(default)]` keeps pre-cues settings files loadable.
+    /// TTS cue config. `serde(default)` keeps pre-cues settings loadable.
     #[serde(default)]
     pub cues: CueSettings,
-    /// Per-device channel routing memory, keyed by `device_key(host, device)`.
-    /// Lets the app restore the channels last used on each interface rather
-    /// than resetting to 1/2 every time the device is reselected.
+    /// Per-device routing memory, keyed by `device_key(host, device)`.
     #[serde(default)]
     pub device_routes: HashMap<String, DeviceRoute>,
 }
 
-/// Persisted click-track configuration. The live `enabled` flag is intentionally
-/// NOT persisted — the app boots with the click stopped so a worship leader
-/// isn't surprised by a live click on launch.
+/// Persisted click-track config. The live `enabled` flag is deliberately NOT
+/// persisted — the app boots stopped so nobody is surprised by a live click.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ClickSettings {
     pub bpm: f32,
@@ -207,9 +196,8 @@ impl Default for ClickSettings {
     }
 }
 
-/// One saved "quick cue" — a labeled bit of text the band can speak with a tap.
-/// `id` is a short opaque string (uuid-ish), independent of label so renames
-/// don't break references from the phone remote.
+/// A labeled bit of text spoken with a tap. `id` is opaque and independent of
+/// label so renames don't break phone-remote references.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct QuickCue {
     pub id: String,
@@ -217,8 +205,8 @@ pub struct QuickCue {
     pub text: String,
 }
 
-/// Persisted TTS cue config. `voice` of `None` means use the system default
-/// SAPI voice. `rate` is the SAPI rate scale, -10..10.
+/// Persisted TTS cue config. `voice` None = system default SAPI voice.
+/// `rate` is the SAPI scale, -10..10.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CueSettings {
     #[serde(default)]
@@ -228,12 +216,10 @@ pub struct CueSettings {
     pub volume: f32,
     pub channel_left: usize,
     pub channel_right: usize,
-    /// Drop the click bus ~12 dB while a cue is speaking. Off by default.
+    /// Drop the click bus ~12 dB while a cue speaks. Off by default.
     #[serde(default)]
     pub duck_click: bool,
-    /// Auto-announce the new key whenever a pad changes (e.g. "Key of G").
-    /// Triggered from `play_key_logic` so desktop and phone-remote presses
-    /// both fire it. Off by default.
+    /// Auto-announce the new key on pad change (e.g. "Key of G"). Off by default.
     #[serde(default)]
     pub speak_key_on_change: bool,
     #[serde(default)]
@@ -244,14 +230,11 @@ impl Default for CueSettings {
     fn default() -> Self {
         CueSettings {
             voice: None,
-            // SAPI default rate sounds rushed for short phrases like the auto
-            // key-announcement. -1 reads as relaxed without sounding sluggish.
+            // SAPI default rate sounds rushed for short phrases; -1 is relaxed.
             rate: -1,
             volume: 0.95,
-            // Default the cue bus to channels 5/6 — most multi-out interfaces
-            // have at least 6 outs and these are commonly free of the pad pair
-            // (1/2) and the click pair (3/4). Falls back to silent if the
-            // device has fewer channels, like the click bus does.
+            // Cue bus defaults to channels 5/6 — usually free of the pad (1/2)
+            // and click (3/4) pairs. Falls back to silent on fewer channels.
             channel_left: 4,
             channel_right: 5,
             duck_click: false,
@@ -295,7 +278,7 @@ impl Settings {
         format!("{host}::{device}")
     }
 
-    /// The current pad/click/cue channels as a `DeviceRoute`.
+    /// Current pad/click/cue channels as a `DeviceRoute`.
     pub fn current_route(&self) -> DeviceRoute {
         DeviceRoute {
             pad_left: self.channel_left,
@@ -307,9 +290,8 @@ impl Settings {
         }
     }
 
-    /// Snapshot the current routing into `device_routes` under the active
-    /// device, so reselecting it later restores these channels. No-op when no
-    /// device is selected.
+    /// Snapshot current routing into `device_routes` for the active device.
+    /// No-op when no device is selected.
     pub fn remember_current_route(&mut self) {
         if let Some(device) = self.output_device.clone() {
             let key = Self::device_key(&self.output_host, &device);
@@ -319,7 +301,7 @@ impl Settings {
     }
 }
 
-/// Live playback state, broadcast to every connected client (desktop + phones).
+/// Live playback state, broadcast to every client.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NowPlaying {
     pub key: Option<Key>,
@@ -345,14 +327,9 @@ impl Default for NowPlaying {
     }
 }
 
-/// Live click-track state. `started_at_ms` lets clients predict the current
-/// beat locally (no per-beat broadcast) — re-set whenever the click is
-/// (re)started or its time signature changes.
-///
-/// `volume` and `accent` mirror their persisted counterparts in `ClickSettings`
-/// so connected clients (e.g. the phone remote) see those edits live over the
-/// WebSocket — broadcasting them is cheaper than asking the remote to refetch
-/// `/api/info` after every toggle.
+/// Live click-track state. `started_at_ms` lets clients predict the beat (no
+/// per-beat broadcast); re-set on (re)start or signature change. `volume`/
+/// `accent` mirror `ClickSettings` so clients see edits live over the WebSocket.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ClickNow {
     pub enabled: bool,
@@ -376,10 +353,8 @@ impl Default for ClickNow {
     }
 }
 
-/// Live TTS cue state. `speaking` flips true the moment a cue starts and back
-/// to false when it finishes (or is stopped). `label` carries the saved quick
-/// cue's label so phones can highlight which button is currently speaking; it
-/// is None for free-form text speaks.
+/// Live TTS cue state. `label` carries the quick cue's label so phones can
+/// highlight the speaking button; None for free-form text speaks.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct CueNow {
     pub speaking: bool,

@@ -1,5 +1,4 @@
-// Inline SVG icons mirroring the originals from the hand-written remote.html.
-// Kept as small components so JSX consumers don't litter with raw <svg> blocks.
+// Inline SVG icons as small components.
 
 export function MarkLogoIcon() {
   return (

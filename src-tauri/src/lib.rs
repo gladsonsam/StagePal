@@ -1,7 +1,4 @@
 // StagePal — Tauri backend entrypoint.
-// Phase 1: hidden-on-boot, system tray, single instance, autostart.
-// Phase 2: audio engine (device routing + crossfade playback).
-// Phase 3: core state, presets/library, settings persistence.
 
 pub mod audio;
 mod commands;
@@ -20,7 +17,7 @@ use tauri::{
     Manager, WindowEvent,
 };
 
-/// Show and focus the main settings window (the window boots hidden).
+/// Show and focus the main window (boots hidden).
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -29,14 +26,9 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
-/// Re-apply saved audio settings to the engine on boot. The click is restored
-/// in everything *except* its `enabled` state — we boot stopped so the user
-/// isn't surprised by a live click on launch.
-///
-/// Runs on a background thread (see `setup`) so a slow ASIO open doesn't pin
-/// the UI. Until this returns, `AudioEngine::has_active` is false, so any
-/// pad/cue press during the boot window surfaces "audio output not ready"
-/// instead of being silently dropped.
+/// Re-apply saved audio settings on boot, except click `enabled` (boots stopped).
+/// Runs on a background thread so a slow ASIO open doesn't pin the UI; until it
+/// returns `has_active` is false and presses surface "audio output not ready".
 fn restore_audio(app: &tauri::AppHandle) {
     let core = app.state::<CoreState>();
     let engine = app.state::<AudioEngine>();
@@ -110,7 +102,7 @@ pub fn run() {
         .manage(AudioEngine::new())
         .manage(commands::CueSynth(Box::new(SapiSynth::new())))
         .setup(|app| {
-            // Load persisted settings into managed CoreState.
+            // Load persisted settings into CoreState.
             let config_path = app
                 .path()
                 .app_config_dir()
@@ -118,21 +110,16 @@ pub fn run() {
                 .unwrap_or_else(|_| std::path::PathBuf::from("settings.json"));
             app.manage(CoreState::load(config_path));
 
-            // Re-bind the saved audio device/channels/volume on a background
-            // thread so a slow or hung audio driver can't block setup() from
-            // returning — the main window needs to show even when audio is
-            // misbehaving.
+            // Restore audio on a background thread so a hung driver can't block
+            // setup() from returning — the window must show regardless.
             let app_for_restore = app.handle().clone();
             std::thread::Builder::new()
                 .name("restore-audio".into())
                 .spawn(move || restore_audio(&app_for_restore))
                 .ok();
 
-            // Pre-warm SAPI. The first PowerShell + System.Speech invocation
-            // costs ~2–4 s on a cold system, which made the first auto-cue
-            // ("Key of G") feel silent until the user touched something else.
-            // A throwaway voice listing on a background thread loads the OS
-            // caches so the first real cue lands instantly.
+            // Pre-warm SAPI: the first System.Speech call costs ~2-4 s cold, so
+            // a throwaway voice listing loads OS caches off-thread.
             let app_for_warm = app.handle().clone();
             std::thread::Builder::new()
                 .name("sapi-prewarm".into())
@@ -144,9 +131,7 @@ pub fn run() {
                 })
                 .ok();
 
-            // Bridge the audio engine's upstream events to NowPlaying
-            // broadcasts so every connected client sees state flip when a
-            // cue or pad ends.
+            // Bridge engine events to NowPlaying broadcasts.
             let events = app.state::<AudioEngine>().events();
             let app_for_events = app.handle().clone();
             std::thread::Builder::new()
@@ -155,8 +140,7 @@ pub fn run() {
                     while let Ok(ev) = events.recv() {
                         match ev {
                             audio::EngineEvent::CueStarted => {
-                                // commands.rs flips speaking=true synchronously
-                                // before calling play_cue, so no work here.
+                                // commands.rs already flipped speaking=true.
                             }
                             audio::EngineEvent::CueEnded => {
                                 let core = app_for_events.state::<CoreState>();
@@ -168,11 +152,9 @@ pub fn run() {
                                 commands::emit_now(&app_for_events, core.inner());
                             }
                             audio::EngineEvent::PadEnded => {
-                                // A pad voice exited unexpectedly (decoder
-                                // errored — file moved, share dropped). Flip
-                                // `playing` back to false so the next press of
-                                // the same key restarts playback instead of
-                                // hitting the deselect path.
+                                // Pad exited unexpectedly (file moved/share
+                                // dropped). Reset so the next press restarts
+                                // rather than hitting the deselect path.
                                 let core = app_for_events.state::<CoreState>();
                                 {
                                     let mut n = core.now.lock().unwrap();
@@ -186,7 +168,7 @@ pub fn run() {
                 })
                 .ok();
 
-            // Start the phone-remote web server on the configured port.
+            // Start the phone-remote web server.
             let port = app
                 .state::<CoreState>()
                 .settings
@@ -207,9 +189,8 @@ pub fn run() {
                     None,
                 ))?;
 
-                // Register the app to start automatically on login. Only in
-                // release builds, so `tauri dev` runs don't add the debug
-                // binary to the OS startup list. enable() is idempotent.
+                // Enable launch-on-login (release only, so dev doesn't register
+                // the debug binary). enable() is idempotent.
                 #[cfg(not(debug_assertions))]
                 {
                     use tauri_plugin_autostart::ManagerExt;
@@ -252,7 +233,7 @@ pub fn run() {
 
             Ok(())
         })
-        // Hide to tray instead of quitting when the window is closed.
+        // Hide to tray instead of quitting on close.
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();

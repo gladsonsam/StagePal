@@ -1,10 +1,8 @@
-//! Text-to-speech "cues" — quick spoken messages the band can fire from the
-//! phone remote to communicate over IEMs without yelling across stage.
+//! Text-to-speech "cues" — quick spoken messages fired from the phone remote
+//! to talk over IEMs without yelling across stage.
 //!
-//! `Synthesizer` is the abstraction; `SapiSynth` is the v1 Windows-only impl
-//! built on `System.Speech.Synthesis` via PowerShell. Swapping for a direct
-//! Win32/COM impl (or a macOS/Linux backend) is a matter of dropping in
-//! another `Synthesizer` and selecting it at construction.
+//! `Synthesizer` is the abstraction; `SapiSynth` is the v1 Windows impl over
+//! PowerShell. Swap in another `Synthesizer` (COM, macOS/Linux) at construction.
 
 mod sapi;
 mod synth;

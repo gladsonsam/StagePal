@@ -17,7 +17,7 @@ type Tab = "pads" | "click" | "cues";
 const STYLE_KEY = "stagepal.remote.padStyle";
 const TAB_KEY = "stagepal.remote.tab";
 
-/** Shape passed to each tab's renderer. Tabs only render the props they use. */
+/** Passed to each tab's renderer. */
 interface TabContext {
   info: Info | null;
   now: NowPlaying;
@@ -32,8 +32,7 @@ interface TabDef {
   render: (ctx: TabContext) => ReactElement;
 }
 
-// One source of truth for tabs — adding a fourth means one more entry, not
-// edits scattered across the tab bar and switch statements.
+// Single source of truth for tabs.
 const TABS: TabDef[] = [
   {
     key: "pads",
