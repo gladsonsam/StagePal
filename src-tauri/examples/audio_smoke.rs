@@ -1,15 +1,10 @@
 //! Headless smoke test for the audio engine.
-//!   cargo run --example audio_smoke            # uses the default output
-//!   cargo run --example audio_smoke -- asio    # first ASIO device
-//!   cargo run --example audio_smoke -- "ASIO" "Focusrite USB ASIO"
+//!   cargo run --example audio_smoke
 //!
 //! Lists output devices, writes a 220 Hz stereo test tone (44.1 kHz, so the
 //! resampler runs when the device is at 48 kHz), then drives the real
 //! AudioEngine: set_output → play (crossfade-in) → stop (fade-out).
-//! If the chosen output is audible you should hear ~3 s of a low tone.
-//!
-//! Use the `-- asio` form to verify an ASIO interface opens: it prints the exact
-//! error from the engine if the device refuses to start.
+//! If your default output is audible you should hear ~3 s of a low tone.
 
 use std::f32::consts::PI;
 use std::fs::File;
@@ -32,26 +27,10 @@ fn main() {
         );
     }
 
-    // Device selection: optional CLI args pick a host (and optionally a device
-    // name). With no args we use the system default. `-- asio` grabs the first
-    // ASIO device — the case worth verifying on real hardware.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let dev = match args.as_slice() {
-        [] => devices.iter().find(|d| d.is_default).cloned(),
-        [host] => devices
-            .iter()
-            .find(|d| d.host.eq_ignore_ascii_case(host))
-            .cloned(),
-        [host, name, ..] => devices
-            .iter()
-            .find(|d| d.host.eq_ignore_ascii_case(host) && d.name == *name)
-            .cloned(),
-    };
-    let Some(dev) = dev else {
-        eprintln!("no matching output device for {args:?}; aborting");
+    let Some(dev) = devices.iter().find(|d| d.is_default).cloned() else {
+        eprintln!("no default output device; aborting");
         return;
     };
-    println!("\nusing: [{}] {} ({} ch)", dev.host, dev.name, dev.channels);
 
     let tone = std::env::temp_dir().join("pad_smoke_tone.wav");
     write_test_wav(&tone, 44_100, 3.0, 220.0).expect("write test wav");

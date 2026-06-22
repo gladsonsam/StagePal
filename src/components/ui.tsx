@@ -5,7 +5,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { useHoldRepeat } from "../shared/useHoldRepeat";
-import { useTapTempo } from "../shared/useTapTempo";
 
 /* ── line icons (1.6 stroke, 20×20 viewbox) ───────────────────────── */
 export type IconName =
@@ -620,7 +619,11 @@ export function BeatDots({
 }
 
 /* ── click: tap-tempo button ──────────────────────────────────────── */
-// Tempo math lives in the shared useTapTempo hook (also used by the remote).
+/**
+ * Maintains a rolling window of recent tap timestamps and reports a fresh BPM
+ * once we have ≥2 taps. A gap of >2 s resets the window (treated as a new
+ * attempt). Caller is responsible for actually committing the BPM upstream.
+ */
 export function TapButton({
   onTap,
   big = false,
@@ -629,11 +632,47 @@ export function TapButton({
   onTap: (bpm: number) => void;
   big?: boolean;
 }) {
-  const { label, hot, tap } = useTapTempo(onTap);
+  const tapsRef = useRef<number[]>([]);
+  const [count, setCount] = useState(0);
+  const idleTimer = useRef<number | null>(null);
+
+  function tap() {
+    const now = performance.now();
+    const last = tapsRef.current[tapsRef.current.length - 1];
+    if (last != null && now - last > 2000) {
+      tapsRef.current = [];
+    }
+    tapsRef.current.push(now);
+    if (tapsRef.current.length > 5) tapsRef.current.shift();
+
+    if (tapsRef.current.length >= 2) {
+      const deltas: number[] = [];
+      for (let i = 1; i < tapsRef.current.length; i++) {
+        deltas.push(tapsRef.current[i] - tapsRef.current[i - 1]);
+      }
+      const sorted = [...deltas].sort((a, b) => a - b);
+      const median = sorted[Math.floor(sorted.length / 2)];
+      const bpm = Math.max(30, Math.min(300, 60_000 / median));
+      onTap(Math.round(bpm * 10) / 10);
+    }
+    setCount(tapsRef.current.length);
+
+    if (idleTimer.current != null) window.clearTimeout(idleTimer.current);
+    idleTimer.current = window.setTimeout(() => {
+      tapsRef.current = [];
+      setCount(0);
+    }, 2200);
+  }
+
+  let label = "TAP";
+  if (count === 1) label = "tap again…";
+  else if (count >= 2 && count < 4) label = `tap ${count} of 4…`;
+  else if (count >= 4) label = "TAP";
+
   return (
     <button
       type="button"
-      className={`tap-btn${hot ? " hot" : ""}${big ? " tap-btn--big" : ""}`}
+      className={`tap-btn${count > 0 ? " hot" : ""}${big ? " tap-btn--big" : ""}`}
       onClick={tap}
     >
       {label}

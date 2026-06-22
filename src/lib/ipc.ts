@@ -9,7 +9,8 @@ import type { Key, NowPlaying } from "../shared/types";
 // in-memory mock so the UI is fully explorable. Production builds always run
 // inside Tauri, where `import.meta.env.DEV` is false and this whole branch (and
 // the dynamically-imported mock) is dropped from the bundle.
-const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const inTauri =
+  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const useMock = import.meta.env.DEV && !inTauri;
 
 function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -31,16 +32,17 @@ export interface DeviceInfo {
   is_default: boolean;
 }
 
-/** The stream the engine currently has open. Null when nothing is open. */
-export interface ActiveOutput {
+export interface AudioDebugReport {
   host: string;
   device: string;
-  channels: number;
-  sample_rate: number;
-  /** "f32" or "i32" — which sample path is feeding the device. */
   sample_format: string;
-  /** Negotiated callback buffer size in frames; null until audio flows. */
-  buffer_frames: number | null;
+  sample_rate: number;
+  channels: number;
+  pad_channels: [number, number];
+  callback_calls: number;
+  frames_written: number;
+  nonzero_frames: number;
+  peak: number;
 }
 
 export interface Preset {
@@ -102,27 +104,19 @@ export interface ServerUrl {
 
 export const getSettings = () => invoke<Settings>("get_settings");
 export const getState = () => invoke<NowPlaying>("get_state");
-export const listAudioDevices = () => invoke<DeviceInfo[]>("list_audio_devices");
-
-/** What the engine has open right now (device, real channel count, rate, …). */
-export const getActiveOutput = () =>
-  invoke<ActiveOutput | null>("get_active_output");
-
-/** Full audio probe across every host/device, as text (also written to log). */
-export const audioDiagnostics = () => invoke<string>("audio_diagnostics");
-
-/** Absolute path of the diagnostic log file, or null if logging is off. */
-export const getLogPath = () => invoke<string | null>("get_log_path");
-
-/** Tail (~64 KB) of the diagnostic log. */
-export const readLog = () => invoke<string>("read_log");
+export const listAudioDevices = () =>
+  invoke<DeviceInfo[]>("list_audio_devices");
 
 export const setAudioOutput = (
   host: string,
   device: string,
   channelLeft: number,
   channelRight: number,
-) => invoke<void>("set_audio_output", { host, device, channelLeft, channelRight });
+) =>
+  invoke<void>("set_audio_output", { host, device, channelLeft, channelRight });
+
+export const runAudioOutputTest = () =>
+  invoke<AudioDebugReport>("run_audio_output_test");
 
 export const setVolume = (volume: number) =>
   invoke<void>("set_volume", { volume });
@@ -224,7 +218,9 @@ export const setCueSpeakKey = (enabled: boolean) =>
   invoke<void>("set_cue_speak_key", { enabled });
 
 /** Subscribe to live now-playing updates pushed from the backend. */
-export const onNowPlaying = (cb: (n: NowPlaying) => void): Promise<UnlistenFn> => {
+export const onNowPlaying = (
+  cb: (n: NowPlaying) => void,
+): Promise<UnlistenFn> => {
   if (useMock) {
     return import("./mock").then((m) => m.mockListen(cb));
   }

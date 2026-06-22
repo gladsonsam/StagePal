@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
-use crate::audio::{ActiveOutput, AudioEngine, DeviceInfo};
+use crate::audio::{AudioDebugReport, AudioEngine, DeviceInfo};
 use crate::cues::{self, Synthesizer, VoiceInfo};
 use crate::library;
 use crate::model::{now_unix_ms, Key, NowPlaying, Preset, QuickCue, Settings};
@@ -76,8 +76,8 @@ pub fn play_key_logic(
             s.cues.speak_key_on_change,
         )
     };
-    let path = path
-        .ok_or_else(|| format!("no file mapped for key {} in the active preset", k.as_str()))?;
+    let path =
+        path.ok_or_else(|| format!("no file mapped for key {} in the active preset", k.as_str()))?;
 
     engine.play(path)?;
     {
@@ -144,11 +144,7 @@ pub fn set_preset_logic(
     Ok(())
 }
 
-pub fn set_crossfade_logic(
-    core: &CoreState,
-    engine: &AudioEngine,
-    ms: u32,
-) -> Result<(), String> {
+pub fn set_crossfade_logic(core: &CoreState, engine: &AudioEngine, ms: u32) -> Result<(), String> {
     let ms = ms.clamp(100, 15_000);
     engine.set_crossfade(ms)?;
     core.settings.lock().unwrap().crossfade_ms = ms;
@@ -288,35 +284,6 @@ pub fn list_audio_devices() -> Vec<DeviceInfo> {
     AudioEngine::list_devices()
 }
 
-/// What the engine has actually got open right now (device, real channel count,
-/// sample rate, format, buffer size). The Settings UI shows this so the user can
-/// confirm a device truly opened — and the routing pickers can size themselves
-/// to the live channel count rather than a probe that might disagree.
-#[tauri::command]
-pub fn get_active_output(engine: State<'_, AudioEngine>) -> Option<ActiveOutput> {
-    engine.active_output()
-}
-
-/// Run a full audio probe across every host/device and return it as text. Also
-/// written to the log file. This is the report to capture when a device won't
-/// open on a machine we can't reach.
-#[tauri::command]
-pub fn audio_diagnostics() -> String {
-    AudioEngine::diagnostics()
-}
-
-/// Absolute path of the diagnostic log file, so the UI can offer "open folder".
-#[tauri::command]
-pub fn get_log_path() -> Option<String> {
-    crate::logging::log_path().map(|p| p.to_string_lossy().into_owned())
-}
-
-/// Tail of the log file (last ~64 KB) for the in-app viewer.
-#[tauri::command]
-pub fn read_log() -> String {
-    crate::logging::read_tail(64 * 1024)
-}
-
 #[tauri::command]
 pub fn set_audio_output(
     core: State<'_, CoreState>,
@@ -326,23 +293,39 @@ pub fn set_audio_output(
     channel_left: usize,
     channel_right: usize,
 ) -> Result<(), String> {
-    // Snap click channels to something sensible for the new device. Keep the
-    // user's existing click pair if it still fits; otherwise default to (2,3)
-    // when the device has ≥4 channels, else fold onto (0,1) — which will mix
-    // the click into the pad bus.
-    let (click_l, click_r, cue_l, cue_r) = {
+    // Resolve the full pad/click/cue routing to apply. Two cases:
+    //   - Switching to a different device: if we've used this device before,
+    //     restore the channels saved for it (so it doesn't snap back to 1/2);
+    //     otherwise fall back to the requested pad pair plus the current
+    //     click/cue pairs as a starting point.
+    //   - Editing the pad channels on the current device: honour the requested
+    //     pad pair and leave click/cue untouched.
+    let ((pad_l, pad_r), (click_l, click_r), (cue_l, cue_r)) = {
         let s = core.settings.lock().unwrap();
-        (
-            s.click.channel_left,
-            s.click.channel_right,
-            s.cues.channel_left,
-            s.cues.channel_right,
-        )
+        let switching =
+            s.output_host != host || s.output_device.as_deref() != Some(device.as_str());
+        let saved = if switching {
+            s.device_routes.get(&Settings::device_key(&host, &device)).copied()
+        } else {
+            None
+        };
+        match saved {
+            Some(r) => (
+                (r.pad_left, r.pad_right),
+                (r.click_left, r.click_right),
+                (r.cue_left, r.cue_right),
+            ),
+            None => (
+                (channel_left, channel_right),
+                (s.click.channel_left, s.click.channel_right),
+                (s.cues.channel_left, s.cues.channel_right),
+            ),
+        }
     };
     engine.set_output(
         &host,
         &device,
-        (channel_left, channel_right),
+        (pad_l, pad_r),
         (click_l, click_r),
         (cue_l, cue_r),
     )?;
@@ -350,10 +333,21 @@ pub fn set_audio_output(
         let mut s = core.settings.lock().unwrap();
         s.output_host = host;
         s.output_device = Some(device);
-        s.channel_left = channel_left;
-        s.channel_right = channel_right;
+        s.channel_left = pad_l;
+        s.channel_right = pad_r;
+        s.click.channel_left = click_l;
+        s.click.channel_right = click_r;
+        s.cues.channel_left = cue_l;
+        s.cues.channel_right = cue_r;
+        // Remember this routing for the device so reselecting it restores it.
+        s.remember_current_route();
     }
     core.save()
+}
+
+#[tauri::command]
+pub fn run_audio_output_test(engine: State<'_, AudioEngine>) -> Result<AudioDebugReport, String> {
+    engine.run_output_test()
 }
 
 #[tauri::command]
@@ -382,8 +376,12 @@ pub fn scan_library(
 
     let preset_name = {
         let s = core.settings.lock().unwrap();
-        name.clone()
-            .or_else(|| s.presets.iter().find(|p| p.id == id).map(|p| p.name.clone()))
+        name.clone().or_else(|| {
+            s.presets
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.name.clone())
+        })
     };
     let fresh = library::scan_preset(&folder_path, preset_name)?;
 
@@ -616,6 +614,7 @@ pub fn set_click_channels_logic(
         let mut s = core.settings.lock().unwrap();
         s.click.channel_left = channel_left;
         s.click.channel_right = channel_right;
+        s.remember_current_route();
     }
     core.save()
 }
@@ -721,7 +720,11 @@ pub fn cue_speak_logic(
     Ok(())
 }
 
-pub fn cue_stop_logic(app: &AppHandle, core: &CoreState, engine: &AudioEngine) -> Result<(), String> {
+pub fn cue_stop_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+) -> Result<(), String> {
     engine.stop_cue()?;
     {
         let mut n = core.now.lock().unwrap();
@@ -864,6 +867,7 @@ pub fn set_cue_channels_logic(
         let mut s = core.settings.lock().unwrap();
         s.cues.channel_left = channel_left;
         s.cues.channel_right = channel_right;
+        s.remember_current_route();
     }
     core.save()
 }
@@ -902,7 +906,15 @@ pub fn cue_speak(
     synth: State<'_, CueSynth>,
     text: String,
 ) -> Result<(), String> {
-    cue_speak_logic(&app, core.inner(), engine.inner(), synth.0.as_ref(), &text, None, None)
+    cue_speak_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        synth.0.as_ref(),
+        &text,
+        None,
+        None,
+    )
 }
 
 #[tauri::command]
@@ -996,4 +1008,3 @@ pub fn set_cue_duck_click(
 pub fn set_cue_speak_key(core: State<'_, CoreState>, enabled: bool) -> Result<(), String> {
     set_cue_speak_key_logic(core.inner(), enabled)
 }
-

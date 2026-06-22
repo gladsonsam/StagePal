@@ -7,8 +7,6 @@ pub mod audio;
 mod commands;
 pub mod cues;
 pub mod library;
-#[macro_use]
-pub mod logging;
 pub mod model;
 mod server;
 mod state;
@@ -85,12 +83,11 @@ fn restore_audio(app: &tauri::AppHandle) {
     let _ = engine.set_click_volume(click_volume);
     let _ = engine.set_duck_click(duck_click);
     if let Some(device) = device {
-        crate::linfo!("[boot] restoring audio output '{device}' on {host}");
-        if let Err(e) = engine.set_output(&host, &device, pad_channels, click_channels, cue_channels) {
-            crate::lerror!("[boot] could not restore audio output '{device}' on {host}: {e}");
+        if let Err(e) =
+            engine.set_output(&host, &device, pad_channels, click_channels, cue_channels)
+        {
+            eprintln!("[boot] could not restore audio output '{device}' on {host}: {e}");
         }
-    } else {
-        crate::linfo!("[boot] no saved output device to restore");
     }
 }
 
@@ -113,15 +110,6 @@ pub fn run() {
         .manage(AudioEngine::new())
         .manage(commands::CueSynth(Box::new(SapiSynth::new())))
         .setup(|app| {
-            // Bring up the file logger first so everything below (audio restore,
-            // device opens) lands in a file the user can read without a toolchain.
-            let log_path = app
-                .path()
-                .app_log_dir()
-                .map(|d| d.join("stagepal.log"))
-                .unwrap_or_else(|_| std::path::PathBuf::from("stagepal.log"));
-            logging::init(log_path);
-
             // Load persisted settings into managed CoreState.
             let config_path = app
                 .path()
@@ -151,7 +139,7 @@ pub fn run() {
                 .spawn(move || {
                     let synth = app_for_warm.state::<commands::CueSynth>();
                     if let Err(e) = synth.0.voices() {
-                        crate::lwarn!("[boot] sapi prewarm: {e}");
+                        eprintln!("[boot] sapi prewarm: {e}");
                     }
                 })
                 .ok();
@@ -228,7 +216,7 @@ pub fn run() {
                     let autostart = app.handle().autolaunch();
                     if !autostart.is_enabled().unwrap_or(false) {
                         if let Err(e) = autostart.enable() {
-                            crate::lwarn!("[autostart] could not enable launch-on-login: {e}");
+                            eprintln!("[autostart] could not enable launch-on-login: {e}");
                         }
                     }
                 }
@@ -275,11 +263,8 @@ pub fn run() {
             commands::get_settings,
             commands::get_state,
             commands::list_audio_devices,
-            commands::get_active_output,
-            commands::audio_diagnostics,
-            commands::get_log_path,
-            commands::read_log,
             commands::set_audio_output,
+            commands::run_audio_output_test,
             commands::set_volume,
             commands::scan_library,
             commands::remove_preset,

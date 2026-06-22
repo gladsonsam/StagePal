@@ -129,31 +129,6 @@ export async function mockInvoke<T>(cmd: string, args: Record<string, unknown> =
       return { ...now } as T;
     case "list_audio_devices":
       return devices as T;
-    case "get_active_output": {
-      const d = devices.find(
-        (x) => x.name === settings.output_device && x.host === settings.output_host,
-      );
-      if (!d) return null as T;
-      return {
-        host: d.host,
-        device: d.name,
-        channels: d.channels,
-        sample_rate: d.default_sample_rate,
-        sample_format: d.host === "ASIO" ? "i32" : "f32",
-        buffer_frames: d.host === "ASIO" ? 256 : 480,
-      } as T;
-    }
-    case "audio_diagnostics":
-      return (
-        "StagePal audio diagnostics (mock)\n" +
-        devices
-          .map((d) => `• [${d.host}] ${d.name} — ${d.channels} ch @ ${d.default_sample_rate} Hz`)
-          .join("\n")
-      ) as T;
-    case "get_log_path":
-      return "C:/Users/you/AppData/Roaming/StagePal/logs/stagepal.log" as T;
-    case "read_log":
-      return "(mock log — diagnostics are only written in the real app)" as T;
     case "server_url":
       return { ip: "192.168.1.42", host: "studio-pc", port: 7777 } as ServerUrl as T;
     case "set_volume":

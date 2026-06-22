@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { NowPlaying } from "../../shared/types";
 import { useHoldRepeat } from "../../shared/useHoldRepeat";
-import { useTapTempo } from "../../shared/useTapTempo";
 import { post } from "../api";
 import { useServerClockOffset } from "../hooks/useServerClockOffset";
 import { MinusIcon, PlusIcon, VolumeIcon } from "./icons";
@@ -45,7 +44,7 @@ export function ClickTab({ now }: Props) {
         </div>
       </div>
 
-      <TapButton />
+      <TapButton currentBpm={now.click?.bpm ?? 90} />
 
       <ClickVolume value={now.click?.volume ?? 0.8} />
 
@@ -211,13 +210,54 @@ function BeatDots({
   );
 }
 
-/** Tempo math lives in the shared useTapTempo hook (also used on desktop). */
-function TapButton() {
-  const { label, hot, tap } = useTapTempo((bpm) =>
-    post("/api/click/bpm", { bpm }),
+/** Rolling 5-tap window, median delta → BPM. Resets after 2.2s of idle. */
+function TapButton({ currentBpm: _currentBpm }: { currentBpm: number }) {
+  const tapsRef = useRef<number[]>([]);
+  const resetRef = useRef<number | null>(null);
+  const [label, setLabel] = useState("TAP");
+  const [hot, setHot] = useState(false);
+
+  const onTap = () => {
+    const t = performance.now();
+    const last = tapsRef.current[tapsRef.current.length - 1];
+    if (last != null && t - last > 2000) tapsRef.current = [];
+    tapsRef.current.push(t);
+    if (tapsRef.current.length > 5) tapsRef.current.shift();
+
+    if (tapsRef.current.length >= 2) {
+      const deltas: number[] = [];
+      for (let i = 1; i < tapsRef.current.length; i++) {
+        deltas.push(tapsRef.current[i] - tapsRef.current[i - 1]);
+      }
+      const sorted = [...deltas].sort((a, b) => a - b);
+      const median = sorted[Math.floor(sorted.length / 2)];
+      const bpm = Math.max(30, Math.min(300, 60000 / median));
+      post("/api/click/bpm", { bpm: Math.round(bpm * 10) / 10 });
+    }
+
+    const n = tapsRef.current.length;
+    if (n === 1) setLabel("tap again…");
+    else if (n < 4) setLabel(`tap ${n} of 4…`);
+    else setLabel("TAP");
+    setHot(n > 0);
+
+    if (resetRef.current != null) window.clearTimeout(resetRef.current);
+    resetRef.current = window.setTimeout(() => {
+      tapsRef.current = [];
+      setLabel("TAP");
+      setHot(false);
+    }, 2200);
+  };
+
+  useEffect(
+    () => () => {
+      if (resetRef.current != null) window.clearTimeout(resetRef.current);
+    },
+    [],
   );
+
   return (
-    <button type="button" className={`tap-pill${hot ? " hot" : ""}`} onClick={tap}>
+    <button type="button" className={`tap-pill${hot ? " hot" : ""}`} onClick={onTap}>
       {label}
     </button>
   );

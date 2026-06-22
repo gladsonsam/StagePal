@@ -149,6 +149,13 @@ h1 {
 .tab-body[hidden] {
   display: none;
 }
+.tab-empty {
+  text-align: center;
+  color: var(--text-3);
+  font-size: 13.5px;
+  line-height: 1.55;
+  margin-top: 24px;
+}
 
 /* ─── click tab ────────────────────────────────────────────── */
 .bpm-block {

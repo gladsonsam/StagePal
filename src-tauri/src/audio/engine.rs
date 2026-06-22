@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -62,20 +62,21 @@ pub struct DeviceInfo {
     pub is_default: bool,
 }
 
-/// Describes the stream that is actually open right now — surfaced to the UI so
-/// the Settings page can show "ASIO Focusrite · 18 ch · 48000 Hz · i32" and the
-/// routing pickers reflect the device's real channel count instead of a guess.
+/// Result from the built-in routed test tone. This is deliberately surfaced to
+/// production builds so a real ASIO rig can tell us whether the callback is
+/// alive and writing nonzero samples, even when the mixer remains silent.
 #[derive(Debug, Clone, Serialize)]
-pub struct ActiveOutput {
+pub struct AudioDebugReport {
     pub host: String,
     pub device: String,
-    pub channels: usize,
-    pub sample_rate: u32,
-    /// "f32" or "i32" — which callback path is feeding the device.
     pub sample_format: String,
-    /// Negotiated callback buffer size in frames, learned from the first
-    /// callback (cpal doesn't report it up front). `None` until audio flows.
-    pub buffer_frames: Option<u32>,
+    pub sample_rate: u32,
+    pub channels: usize,
+    pub pad_channels: (usize, usize),
+    pub callback_calls: u64,
+    pub frames_written: u64,
+    pub nonzero_frames: u64,
+    pub peak: f32,
 }
 
 /// Which mixed-output bus a voice routes into. Pads and cues mix into separate
@@ -129,6 +130,9 @@ enum PlayCommand {
     /// Toggle the cue→click ducking ramp (true while a cue is speaking AND
     /// the user has duck_click enabled).
     SetClickDuckActive(bool),
+    /// Short sine tone mixed directly onto the pad bus. Used for field
+    /// diagnostics because it bypasses file decode and pad library state.
+    StartDiagnosticTone(DiagnosticTone),
 }
 
 /// Initial click configuration handed to the audio callback when it's built.
@@ -179,6 +183,29 @@ enum EngineCommand {
     SetClickVolume(f32),
     /// Persisted "duck the click while a cue speaks" toggle.
     SetDuckClick(bool),
+    RunOutputTest {
+        reply: Sender<Result<AudioDebugReport, String>>,
+    },
+}
+
+#[derive(Clone)]
+struct StreamDebugInfo {
+    host: String,
+    device: String,
+    sample_format: String,
+    sample_rate: u32,
+    channels: usize,
+    pad_channels: (usize, usize),
+}
+
+struct DiagnosticTone {
+    phase: f32,
+    phase_inc: f32,
+    frames_left: u64,
+    total_frames: Arc<AtomicU64>,
+    nonzero_frames: Arc<AtomicU64>,
+    callback_calls: Arc<AtomicU64>,
+    peak_bits: Arc<AtomicU32>,
 }
 
 /// Internal messages sent from watcher threads back into the host thread.
@@ -224,12 +251,6 @@ pub struct AudioEngine {
     /// True while the host thread is mid-`build_stream`. Used to attribute
     /// timeouts correctly when a second SetOutput is queued behind a hung one.
     build_in_progress: Arc<AtomicBool>,
-    /// Snapshot of the currently-open stream (None when no device is up or the
-    /// last open failed). Set by the host thread, read by `active_output`.
-    active_output: Arc<Mutex<Option<ActiveOutput>>>,
-    /// Live callback buffer size in frames, written by the RT callback on each
-    /// invocation (0 = no audio has flowed yet). Read into `ActiveOutput`.
-    buffer_frames: Arc<AtomicU32>,
 }
 
 impl Default for AudioEngine {
@@ -245,12 +266,8 @@ impl AudioEngine {
         let (events_tx, events_rx) = crossbeam_channel::unbounded();
         let has_active = Arc::new(AtomicBool::new(false));
         let build_in_progress = Arc::new(AtomicBool::new(false));
-        let active_output = Arc::new(Mutex::new(None));
-        let buffer_frames = Arc::new(AtomicU32::new(0));
         let has_active_t = has_active.clone();
         let build_in_progress_t = build_in_progress.clone();
-        let active_output_t = active_output.clone();
-        let buffer_frames_t = buffer_frames.clone();
         std::thread::Builder::new()
             .name("audio-host".into())
             .spawn(move || {
@@ -261,8 +278,6 @@ impl AudioEngine {
                     events_tx,
                     has_active_t,
                     build_in_progress_t,
-                    active_output_t,
-                    buffer_frames_t,
                 )
             })
             .expect("failed to spawn audio host thread");
@@ -271,20 +286,7 @@ impl AudioEngine {
             events_rx,
             has_active,
             build_in_progress,
-            active_output,
-            buffer_frames,
         }
-    }
-
-    /// Snapshot of the stream that is currently open (device, channels, sample
-    /// rate, format, live buffer size), or `None` when nothing is open.
-    pub fn active_output(&self) -> Option<ActiveOutput> {
-        let mut info = self.active_output.lock().unwrap().clone();
-        if let Some(ref mut o) = info {
-            let bf = self.buffer_frames.load(Ordering::Relaxed);
-            o.buffer_frames = (bf > 0).then_some(bf);
-        }
-        info
     }
 
     /// Borrow the upstream event stream. Cloneable (crossbeam Receiver),
@@ -333,110 +335,6 @@ impl AudioEngine {
             }
         }
         out
-    }
-
-    /// Produce a full human-readable audio report — every host, every device,
-    /// its default config and all supported (format, channels, sample-rate)
-    /// combinations — and write it to the log. Returned as a string so the UI
-    /// can show or copy it. This is the artifact to ask a user for when a device
-    /// won't open: it captures exactly what cpal sees on their machine.
-    pub fn diagnostics() -> String {
-        let mut report = String::new();
-        report.push_str(&format!(
-            "StagePal audio diagnostics (v{})\n",
-            env!("CARGO_PKG_VERSION")
-        ));
-        let default_host = cpal::default_host();
-        let default_dev = default_host
-            .default_output_device()
-            .and_then(|d| d.name().ok());
-        report.push_str(&format!(
-            "default host: {} | default output: {}\n",
-            host_id_label(default_host.id()),
-            default_dev.as_deref().unwrap_or("(none)")
-        ));
-        report.push_str(&format!(
-            "hosts available: {}\n",
-            cpal::available_hosts()
-                .iter()
-                .map(|h| host_id_label(*h))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-
-        for host_id in cpal::available_hosts() {
-            let label = host_id_label(host_id);
-            report.push_str(&format!("\n== {label} ==\n"));
-            let host = match cpal::host_from_id(host_id) {
-                Ok(h) => h,
-                Err(e) => {
-                    report.push_str(&format!("  ! could not open host: {e}\n"));
-                    continue;
-                }
-            };
-            let devices = match host.output_devices() {
-                Ok(d) => d,
-                Err(e) => {
-                    report.push_str(&format!("  ! could not enumerate devices: {e}\n"));
-                    continue;
-                }
-            };
-            let mut any = false;
-            for device in devices {
-                any = true;
-                let name = device.name().unwrap_or_else(|_| "(unnamed)".into());
-                report.push_str(&format!("  • {name}\n"));
-                match device.default_output_config() {
-                    Ok(c) => report.push_str(&format!(
-                        "      default: {} ch, {} Hz, {:?}\n",
-                        c.channels(),
-                        c.sample_rate().0,
-                        c.sample_format()
-                    )),
-                    Err(e) => report.push_str(&format!("      default config error: {e}\n")),
-                }
-                match device.supported_output_configs() {
-                    Ok(cfgs) => {
-                        // Collapse the (often large) ASIO list to: per format,
-                        // the max channel count and the set of sample rates.
-                        let cfgs: Vec<_> = cfgs.collect();
-                        if cfgs.is_empty() {
-                            report.push_str("      supported: (none reported)\n");
-                        }
-                        for fmt in [
-                            SampleFormat::F32,
-                            SampleFormat::I32,
-                            SampleFormat::I16,
-                            SampleFormat::U16,
-                        ] {
-                            let matching: Vec<_> =
-                                cfgs.iter().filter(|c| c.sample_format() == fmt).collect();
-                            if matching.is_empty() {
-                                continue;
-                            }
-                            let max_ch =
-                                matching.iter().map(|c| c.channels()).max().unwrap_or(0);
-                            let mut rates: Vec<u32> = matching
-                                .iter()
-                                .map(|c| c.max_sample_rate().0)
-                                .collect();
-                            rates.sort_unstable();
-                            rates.dedup();
-                            report.push_str(&format!(
-                                "      supported {fmt:?}: up to {max_ch} ch @ {rates:?} Hz\n"
-                            ));
-                        }
-                    }
-                    Err(e) => report.push_str(&format!("      supported configs error: {e}\n")),
-                }
-            }
-            if !any {
-                report.push_str("  (no output devices)\n");
-            }
-        }
-
-        crate::linfo!("audio diagnostics requested:\n{report}");
-        report
     }
 
     pub fn set_output(
@@ -570,6 +468,23 @@ impl AudioEngine {
             .send(EngineCommand::SetCrossfade(ms))
             .map_err(|_| "audio host thread is gone".to_string())
     }
+
+    pub fn run_output_test(&self) -> Result<AudioDebugReport, String> {
+        if !self.has_active.load(Ordering::Relaxed) {
+            return Err("audio output not ready - set or restore an output device first".into());
+        }
+        let (reply, reply_rx) = crossbeam_channel::bounded(1);
+        self.tx
+            .send(EngineCommand::RunOutputTest { reply })
+            .map_err(|_| "audio host thread is gone".to_string())?;
+        match reply_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(r) => r,
+            Err(RecvTimeoutError::Timeout) => {
+                Err("audio output test timed out - callback may not be running".into())
+            }
+            Err(RecvTimeoutError::Disconnected) => Err("audio host thread did not reply".into()),
+        }
+    }
 }
 
 /// Live stream + the producer end of the callback's command queue.
@@ -577,22 +492,15 @@ struct ActiveStream {
     _stream: cpal::Stream,
     cmd_tx: rtrb::Producer<PlayCommand>,
     out_rate: u32,
-    /// What this stream actually opened as, for the UI / diagnostics.
-    info: ActiveOutput,
+    /// Incremented once per real-time callback invocation. Lets the host thread
+    /// confirm the driver actually started firing callbacks — ASIO devices can
+    /// open "dead" (build + play succeed, but no callback ever runs), and the
+    /// only cure is tearing the stream down and rebuilding it.
+    heartbeat: Arc<AtomicU64>,
+    debug: StreamDebugInfo,
 }
 
 const DEFAULT_CROSSFADE_MS: u32 = 2000;
-
-/// How long to let a *cold* ASIO stream actually run before tearing it down to
-/// prime the driver (see `build_stream_primed`). The manual cure — "change a
-/// channel, then change back" — leaves a stream running for a beat before the
-/// reopen, and some virtual ASIO drivers (notably Voicemeeter's Virtual ASIO)
-/// only start routing audio on a reopen that follows a genuinely-running stream.
-const COLD_OPEN_WARMUP: Duration = Duration::from_millis(600);
-
-/// Settle after releasing a warmed-up cold stream, before the next open. Virtual
-/// ASIO drivers can take a moment to fully relinquish the device.
-const COLD_OPEN_REOPEN_SETTLE: Duration = Duration::from_millis(250);
 
 /// Per-frame gain step so a 0→1 (or 1→0) ramp completes in `ms` at `rate`.
 fn fade_step(ms: u32, rate: u32) -> f32 {
@@ -615,18 +523,123 @@ fn host_from_label(label: &str) -> Result<cpal::Host, String> {
     Err(format!("audio host '{label}' is not available"))
 }
 
-/// Brief (channels, sample_rate) summary for device-list rendering. Mirrors
-/// `pick_supported` so the dropdown shows the channel count and rate the device
-/// will *actually* open with — not a different probe that could disagree (which
-/// is exactly how the old ASIO bug hid: the list showed 18 ch while the stream
-/// opened mono). Returns `None` if no f32/i32 config is reachable, so such a
-/// device is dropped from the picker instead of looking selectable-but-broken.
+/// Brief (channels, sample_rate) summary for device-list rendering.
+/// Prefers an f32 config (matches the default `build_output_stream` path) and
+/// falls back to whatever the default config reports.
 fn best_output_summary(device: &cpal::Device) -> Option<(usize, u32)> {
-    let cfg = pick_supported(device).ok()?;
+    if let Ok(configs) = device.supported_output_configs() {
+        // Highest channel count + a reasonable default sample rate.
+        let mut best: Option<(u16, u32, SampleFormat)> = None;
+        for cfg in configs {
+            let channels = cfg.channels();
+            let sr = cfg
+                .max_sample_rate()
+                .0
+                .min(48_000)
+                .max(cfg.min_sample_rate().0);
+            let fmt = cfg.sample_format();
+            // Prefer f32 over i32 when both are available, otherwise prefer
+            // higher channel count.
+            let candidate = (channels, sr, fmt);
+            best = Some(match best {
+                None => candidate,
+                Some(cur) => {
+                    let cur_f32 = matches!(cur.2, SampleFormat::F32);
+                    let new_f32 = matches!(fmt, SampleFormat::F32);
+                    if new_f32 && !cur_f32 {
+                        candidate
+                    } else if !new_f32 && cur_f32 {
+                        cur
+                    } else if channels > cur.0 {
+                        candidate
+                    } else {
+                        cur
+                    }
+                }
+            });
+        }
+        if let Some((ch, sr, _)) = best {
+            return Some((ch as usize, sr));
+        }
+    }
+    let cfg = device.default_output_config().ok()?;
     Some((cfg.channels() as usize, cfg.sample_rate().0))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Fade-in used when a pad is auto-restored onto a freshly-rebuilt stream
+/// (device or channel switch). Deliberately short — the device reopen already
+/// introduced a brief gap, so we want the pad back quickly rather than easing
+/// it in over the full crossfade duration.
+const RESTORE_FADE_MS: u32 = 200;
+
+/// Brief pause after releasing the old stream before opening the new one. Some
+/// ASIO drivers don't fully relinquish the device synchronously when their
+/// stream is dropped; this gives the driver a moment to settle so the re-open
+/// lands cleanly instead of racing a half-closed driver. Only applied when we
+/// actually dropped a prior stream, so a first-time open stays instant.
+const ASIO_RELEASE_SETTLE: Duration = Duration::from_millis(75);
+
+/// How long to let a *cold* ASIO stream actually run before tearing it down to
+/// prime the driver (see the cold-open prime in `build_stream_live`). The manual
+/// cure — "change a channel, then change back" — leaves the first stream running
+/// for a beat before the reopen, and some virtual ASIO drivers (notably
+/// Voicemeeter's Virtual ASIO) only start routing audio on a reopen that follows
+/// a stream that was genuinely running. Reproduce that dwell time here.
+const COLD_OPEN_WARMUP: Duration = Duration::from_millis(600);
+
+/// Settle after releasing the warmed-up cold stream, before the priming reopen.
+/// Longer than `ASIO_RELEASE_SETTLE` because virtual ASIO drivers can take a
+/// little longer to fully relinquish the device than hardware ones.
+const COLD_OPEN_REOPEN_SETTLE: Duration = Duration::from_millis(250);
+
+/// Spawn a decoder for `path`, push it onto the active stream as a fading-in
+/// pad voice, and start a watcher tied to a fresh pad generation. Shared by the
+/// `Play` command and the auto-restore that runs after a stream rebuild so both
+/// paths produce identical voice + watcher wiring.
+fn start_pad_voice(
+    act: &mut ActiveStream,
+    path: PathBuf,
+    fade_in_ms: u32,
+    pad_generation: &Arc<AtomicU64>,
+    notify_tx: &Sender<HostNotify>,
+) {
+    let dec = decode::spawn(path, act.out_rate, true, false);
+    let voice = Voice {
+        consumer: dec.consumer,
+        stop: dec.stop,
+        ended: dec.ended.clone(),
+        bus: VoiceBus::Pad,
+        gain: 0.0,
+        target: 1.0,
+        step: fade_step(fade_in_ms, act.out_rate),
+        remove_when_silent: false,
+    };
+    let _ = act.cmd_tx.push(PlayCommand::Crossfade(voice));
+    // Bump the pad generation, then spawn a watcher tied to this generation. If
+    // the decoder later exits for any reason — natural crossfade-stop, explicit
+    // Stop, or an error mid-set — the host will see NotifyPadEnded. The host
+    // only emits EngineEvent::PadEnded when the generation still matches: a
+    // crossfade or Stop bumps the generation first, so those legitimate exits
+    // stay quiet.
+    let my_gen = pad_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    let watcher_ended = dec.ended;
+    let watcher_notify = notify_tx.clone();
+    let watcher_gen_arc = pad_generation.clone();
+    std::thread::Builder::new()
+        .name("pad-watcher".into())
+        .spawn(move || {
+            while !watcher_ended.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            // Skip post if the pad has already been replaced (saves a no-op
+            // trip through the host loop).
+            if watcher_gen_arc.load(Ordering::Relaxed) == my_gen {
+                let _ = watcher_notify.send(HostNotify::PadEnded(my_gen));
+            }
+        })
+        .ok();
+}
+
 fn host_thread(
     rx: Receiver<EngineCommand>,
     notify_rx: Receiver<HostNotify>,
@@ -634,8 +647,6 @@ fn host_thread(
     events: crossbeam_channel::Sender<EngineEvent>,
     has_active: Arc<AtomicBool>,
     build_in_progress: Arc<AtomicBool>,
-    active_output: Arc<Mutex<Option<ActiveOutput>>>,
-    buffer_frames: Arc<AtomicU32>,
 ) {
     let mut active: Option<ActiveStream> = None;
     let mut master: f32 = 0.8;
@@ -650,6 +661,11 @@ fn host_thread(
         click: (2, 3),
         cue: (4, 5),
     };
+    // Path of the pad currently playing (looping), if any. Tracked so that when
+    // the stream is rebuilt for a device/channel switch — which drops the old
+    // stream and every voice it carried — we can re-spawn the same pad on the
+    // new stream and playback simply continues instead of going silent.
+    let mut current_pad: Option<PathBuf> = None;
     // Click state shadow — re-applied on every stream rebuild. `enabled` is
     // deliberately not seeded from settings on boot (worship leaders shouldn't
     // be surprised by a live click on launch); the desktop/remote toggle it on.
@@ -690,331 +706,448 @@ fn host_thread(
                 Err(_) => break,
             };
             match cmd {
-            EngineCommand::SetOutput {
-                host,
-                device,
-                pad_channels,
-                click_channels,
-                cue_channels,
-                reply,
-            } => {
-                let click_init = ClickInit {
-                    enabled: click_enabled,
-                    bpm: click_bpm,
-                    beats_per_bar: click_beats,
-                    accent: click_accent,
-                    volume: click_volume,
-                };
-                let channels = ChannelLayout {
-                    pad: pad_channels,
-                    click: click_channels,
-                    cue: cue_channels,
-                };
-                // Cold open == the host thread holds no live stream yet (boot
-                // auto-restore, or first device pick). Those need the ASIO prime;
-                // a warm reselect already has a running stream and doesn't.
-                let cold_open = active.is_none();
-                build_in_progress.store(true, Ordering::Relaxed);
-                let result = build_stream_primed(
-                    &host,
-                    &device,
-                    channels,
-                    master,
-                    cue_volume,
-                    click_init,
-                    &buffer_frames,
-                    cold_open,
-                );
-                build_in_progress.store(false, Ordering::Relaxed);
-                match result {
-                    Ok(stream) => {
-                        // Replacing the old stream drops it and every voice it
-                        // was carrying. Invalidate any orphan pad/cue watcher,
-                        // flush playing-state immediately (don't wait for the
-                        // ~300ms watcher tail), and re-apply the cue duck on
-                        // the freshly-built stream so a mid-cue rebuild
-                        // doesn't slam the click back to full volume.
-                        pad_generation.fetch_add(1, Ordering::Relaxed);
-                        cue_generation.fetch_add(1, Ordering::Relaxed);
-                        if cue_active {
-                            cue_active = false;
-                            let _ = events.send(EngineEvent::CueEnded);
+                EngineCommand::SetOutput {
+                    host,
+                    device,
+                    pad_channels,
+                    click_channels,
+                    cue_channels,
+                    reply,
+                } => {
+                    let click_init = ClickInit {
+                        enabled: click_enabled,
+                        bpm: click_bpm,
+                        beats_per_bar: click_beats,
+                        accent: click_accent,
+                        volume: click_volume,
+                    };
+                    let channels = ChannelLayout {
+                        pad: pad_channels,
+                        click: click_channels,
+                        cue: cue_channels,
+                    };
+                    // Release the current stream BEFORE opening the next one.
+                    // ASIO drivers are single-client: holding the old stream
+                    // open while building the new one makes the re-open produce
+                    // no audio, which is why a channel/device change needed a
+                    // toggle away-and-back to come alive. Dropping first frees
+                    // the driver so the new stream opens hot and outputs
+                    // immediately. Trade-off: if the new open fails we no longer
+                    // fall back to the old stream — but a silent "switched but
+                    // dead" device is exactly the bug we're fixing, and the
+                    // error is surfaced to the UI either way.
+                    let had_stream = active.take().is_some();
+                    has_active.store(false, Ordering::Relaxed);
+                    if had_stream {
+                        std::thread::sleep(ASIO_RELEASE_SETTLE);
+                    }
+                    build_in_progress.store(true, Ordering::Relaxed);
+                    // `!had_stream` == cold open: no live stream preceded this,
+                    // so the new one must be primed (see build_stream_live).
+                    let result = build_stream_live(
+                        &host,
+                        &device,
+                        channels,
+                        master,
+                        cue_volume,
+                        click_init,
+                        !had_stream,
+                    );
+                    build_in_progress.store(false, Ordering::Relaxed);
+                    match result {
+                        Ok(stream) => {
+                            // Replacing the old stream drops it and every voice it
+                            // was carrying. Invalidate any orphan pad/cue watcher,
+                            // flush playing-state immediately (don't wait for the
+                            // ~300ms watcher tail), and re-apply the cue duck on
+                            // the freshly-built stream so a mid-cue rebuild
+                            // doesn't slam the click back to full volume.
+                            pad_generation.fetch_add(1, Ordering::Relaxed);
+                            cue_generation.fetch_add(1, Ordering::Relaxed);
+                            if cue_active {
+                                cue_active = false;
+                                let _ = events.send(EngineEvent::CueEnded);
+                            }
+                            last_host = host;
+                            last_device = device;
+                            last_channels = channels;
+                            active = Some(stream);
+                            has_active.store(true, Ordering::Relaxed);
+                            // Re-spawn the pad that was playing before the
+                            // rebuild so a device/channel switch is seamless —
+                            // the user doesn't have to manually re-trigger it.
+                            if let (Some(act), Some(path)) = (active.as_mut(), current_pad.clone()) {
+                                start_pad_voice(
+                                    act,
+                                    path,
+                                    RESTORE_FADE_MS,
+                                    &pad_generation,
+                                    &notify_tx,
+                                );
+                            }
+                            let _ = reply.send(Ok(()));
                         }
-                        last_host = host;
-                        last_device = device;
-                        last_channels = channels;
-                        *active_output.lock().unwrap() = Some(stream.info.clone());
-                        active = Some(stream);
-                        has_active.store(true, Ordering::Relaxed);
-                        let _ = reply.send(Ok(()));
-                    }
-                    Err(e) => {
-                        crate::lerror!("[audio] set_output failed: {e}");
-                        active = None;
-                        has_active.store(false, Ordering::Relaxed);
-                        *active_output.lock().unwrap() = None;
-                        // The device that just failed isn't worth retrying for
-                        // subsequent channel-only edits — clear `last_*` so the
-                        // next SetClickChannels/SetCueChannels short-circuits
-                        // with an honest "no device" response instead of
-                        // re-running the same failure under the hood.
-                        last_host.clear();
-                        last_device.clear();
-                        let _ = reply.send(Err(e));
-                    }
-                }
-            }
-            EngineCommand::SetClickChannels { channels, reply } => {
-                if last_device.is_empty() {
-                    let _ = reply.send(Ok(()));
-                    continue;
-                }
-                let click_init = ClickInit {
-                    enabled: click_enabled,
-                    bpm: click_bpm,
-                    beats_per_bar: click_beats,
-                    accent: click_accent,
-                    volume: click_volume,
-                };
-                let next = ChannelLayout { click: channels, ..last_channels };
-                build_in_progress.store(true, Ordering::Relaxed);
-                let result = build_stream(&last_host, &last_device, next, master, cue_volume, click_init, &buffer_frames);
-                build_in_progress.store(false, Ordering::Relaxed);
-                match result {
-                    Ok(stream) => {
-                        pad_generation.fetch_add(1, Ordering::Relaxed);
-                        cue_generation.fetch_add(1, Ordering::Relaxed);
-                        if cue_active {
-                            cue_active = false;
-                            let _ = events.send(EngineEvent::CueEnded);
+                        Err(e) => {
+                            active = None;
+                            has_active.store(false, Ordering::Relaxed);
+                            // The device that just failed isn't worth retrying for
+                            // subsequent channel-only edits — clear `last_*` so the
+                            // next SetClickChannels/SetCueChannels short-circuits
+                            // with an honest "no device" response instead of
+                            // re-running the same failure under the hood.
+                            last_host.clear();
+                            last_device.clear();
+                            let _ = reply.send(Err(e));
                         }
-                        last_channels = next;
-                        *active_output.lock().unwrap() = Some(stream.info.clone());
-                        active = Some(stream);
-                        has_active.store(true, Ordering::Relaxed);
+                    }
+                }
+                EngineCommand::SetClickChannels { channels, reply } => {
+                    if last_device.is_empty() {
                         let _ = reply.send(Ok(()));
+                        continue;
                     }
-                    Err(e) => {
-                        crate::lerror!("[audio] re-open for channel change failed: {e}");
-                        active = None;
-                        has_active.store(false, Ordering::Relaxed);
-                        *active_output.lock().unwrap() = None;
-                        last_host.clear();
-                        last_device.clear();
-                        let _ = reply.send(Err(e));
+                    let click_init = ClickInit {
+                        enabled: click_enabled,
+                        bpm: click_bpm,
+                        beats_per_bar: click_beats,
+                        accent: click_accent,
+                        volume: click_volume,
+                    };
+                    let next = ChannelLayout {
+                        click: channels,
+                        ..last_channels
+                    };
+                    // Release the current stream BEFORE opening the next one.
+                    // ASIO drivers are single-client: holding the old stream
+                    // open while building the new one makes the re-open produce
+                    // no audio, which is why a channel/device change needed a
+                    // toggle away-and-back to come alive. Dropping first frees
+                    // the driver so the new stream opens hot and outputs
+                    // immediately. Trade-off: if the new open fails we no longer
+                    // fall back to the old stream — but a silent "switched but
+                    // dead" device is exactly the bug we're fixing, and the
+                    // error is surfaced to the UI either way.
+                    let had_stream = active.take().is_some();
+                    has_active.store(false, Ordering::Relaxed);
+                    if had_stream {
+                        std::thread::sleep(ASIO_RELEASE_SETTLE);
                     }
-                }
-            }
-            EngineCommand::SetCueChannels { channels, reply } => {
-                if last_device.is_empty() {
-                    let _ = reply.send(Ok(()));
-                    continue;
-                }
-                let click_init = ClickInit {
-                    enabled: click_enabled,
-                    bpm: click_bpm,
-                    beats_per_bar: click_beats,
-                    accent: click_accent,
-                    volume: click_volume,
-                };
-                let next = ChannelLayout { cue: channels, ..last_channels };
-                build_in_progress.store(true, Ordering::Relaxed);
-                let result = build_stream(&last_host, &last_device, next, master, cue_volume, click_init, &buffer_frames);
-                build_in_progress.store(false, Ordering::Relaxed);
-                match result {
-                    Ok(stream) => {
-                        pad_generation.fetch_add(1, Ordering::Relaxed);
-                        cue_generation.fetch_add(1, Ordering::Relaxed);
-                        if cue_active {
-                            cue_active = false;
-                            let _ = events.send(EngineEvent::CueEnded);
+                    build_in_progress.store(true, Ordering::Relaxed);
+                    let result = build_stream_live(
+                        &last_host,
+                        &last_device,
+                        next,
+                        master,
+                        cue_volume,
+                        click_init,
+                        !had_stream,
+                    );
+                    build_in_progress.store(false, Ordering::Relaxed);
+                    match result {
+                        Ok(stream) => {
+                            pad_generation.fetch_add(1, Ordering::Relaxed);
+                            cue_generation.fetch_add(1, Ordering::Relaxed);
+                            if cue_active {
+                                cue_active = false;
+                                let _ = events.send(EngineEvent::CueEnded);
+                            }
+                            last_channels = next;
+                            active = Some(stream);
+                            has_active.store(true, Ordering::Relaxed);
+                            // Re-spawn the pad that was playing before the
+                            // rebuild so a device/channel switch is seamless —
+                            // the user doesn't have to manually re-trigger it.
+                            if let (Some(act), Some(path)) = (active.as_mut(), current_pad.clone()) {
+                                start_pad_voice(
+                                    act,
+                                    path,
+                                    RESTORE_FADE_MS,
+                                    &pad_generation,
+                                    &notify_tx,
+                                );
+                            }
+                            let _ = reply.send(Ok(()));
                         }
-                        last_channels = next;
-                        *active_output.lock().unwrap() = Some(stream.info.clone());
-                        active = Some(stream);
-                        has_active.store(true, Ordering::Relaxed);
-                        let _ = reply.send(Ok(()));
-                    }
-                    Err(e) => {
-                        crate::lerror!("[audio] re-open for channel change failed: {e}");
-                        active = None;
-                        has_active.store(false, Ordering::Relaxed);
-                        *active_output.lock().unwrap() = None;
-                        last_host.clear();
-                        last_device.clear();
-                        let _ = reply.send(Err(e));
+                        Err(e) => {
+                            active = None;
+                            has_active.store(false, Ordering::Relaxed);
+                            last_host.clear();
+                            last_device.clear();
+                            let _ = reply.send(Err(e));
+                        }
                     }
                 }
-            }
-            EngineCommand::Play(path) => {
-                if let Some(act) = active.as_mut() {
-                    let dec = decode::spawn(path, act.out_rate, true, false);
+                EngineCommand::SetCueChannels { channels, reply } => {
+                    if last_device.is_empty() {
+                        let _ = reply.send(Ok(()));
+                        continue;
+                    }
+                    let click_init = ClickInit {
+                        enabled: click_enabled,
+                        bpm: click_bpm,
+                        beats_per_bar: click_beats,
+                        accent: click_accent,
+                        volume: click_volume,
+                    };
+                    let next = ChannelLayout {
+                        cue: channels,
+                        ..last_channels
+                    };
+                    // Release the current stream BEFORE opening the next one.
+                    // ASIO drivers are single-client: holding the old stream
+                    // open while building the new one makes the re-open produce
+                    // no audio, which is why a channel/device change needed a
+                    // toggle away-and-back to come alive. Dropping first frees
+                    // the driver so the new stream opens hot and outputs
+                    // immediately. Trade-off: if the new open fails we no longer
+                    // fall back to the old stream — but a silent "switched but
+                    // dead" device is exactly the bug we're fixing, and the
+                    // error is surfaced to the UI either way.
+                    let had_stream = active.take().is_some();
+                    has_active.store(false, Ordering::Relaxed);
+                    if had_stream {
+                        std::thread::sleep(ASIO_RELEASE_SETTLE);
+                    }
+                    build_in_progress.store(true, Ordering::Relaxed);
+                    let result = build_stream_live(
+                        &last_host,
+                        &last_device,
+                        next,
+                        master,
+                        cue_volume,
+                        click_init,
+                        !had_stream,
+                    );
+                    build_in_progress.store(false, Ordering::Relaxed);
+                    match result {
+                        Ok(stream) => {
+                            pad_generation.fetch_add(1, Ordering::Relaxed);
+                            cue_generation.fetch_add(1, Ordering::Relaxed);
+                            if cue_active {
+                                cue_active = false;
+                                let _ = events.send(EngineEvent::CueEnded);
+                            }
+                            last_channels = next;
+                            active = Some(stream);
+                            has_active.store(true, Ordering::Relaxed);
+                            // Re-spawn the pad that was playing before the
+                            // rebuild so a device/channel switch is seamless —
+                            // the user doesn't have to manually re-trigger it.
+                            if let (Some(act), Some(path)) = (active.as_mut(), current_pad.clone()) {
+                                start_pad_voice(
+                                    act,
+                                    path,
+                                    RESTORE_FADE_MS,
+                                    &pad_generation,
+                                    &notify_tx,
+                                );
+                            }
+                            let _ = reply.send(Ok(()));
+                        }
+                        Err(e) => {
+                            active = None;
+                            has_active.store(false, Ordering::Relaxed);
+                            last_host.clear();
+                            last_device.clear();
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                }
+                EngineCommand::Play(path) => {
+                    if let Some(act) = active.as_mut() {
+                        // Remember the pad so a later device/channel switch can
+                        // re-spawn it on the rebuilt stream and keep it playing.
+                        current_pad = Some(path.clone());
+                        start_pad_voice(act, path, crossfade_ms, &pad_generation, &notify_tx);
+                    } else {
+                        eprintln!("[audio] Play ignored: no output device configured");
+                    }
+                }
+                EngineCommand::Stop => {
+                    // User stopped the pad — don't auto-restore it on the next
+                    // stream rebuild.
+                    current_pad = None;
+                    if let Some(act) = active.as_mut() {
+                        // Invalidate the current pad watcher so its eventual
+                        // PadEnded post is ignored — the user initiated the stop,
+                        // they don't need a redundant "pad ended" event.
+                        pad_generation.fetch_add(1, Ordering::Relaxed);
+                        let step = fade_step(crossfade_ms, act.out_rate);
+                        let _ = act.cmd_tx.push(PlayCommand::FadeOutAll(step));
+                    }
+                }
+                EngineCommand::PlayCue(path) => {
+                    let Some(act) = active.as_mut() else {
+                        eprintln!("[audio] PlayCue ignored: no output device configured");
+                        // The synthesized temp WAV would normally be deleted by
+                        // decode::spawn's thread on exit (delete_on_exit=true).
+                        // We never reach that path here, so clean up directly
+                        // instead of leaking the file in %TEMP%.
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    };
+                    let dec = decode::spawn(path, act.out_rate, false, true);
                     let voice = Voice {
                         consumer: dec.consumer,
                         stop: dec.stop,
                         ended: dec.ended.clone(),
-                        bus: VoiceBus::Pad,
-                        gain: 0.0,
+                        bus: VoiceBus::Cue,
+                        gain: 1.0,
                         target: 1.0,
-                        step: fade_step(crossfade_ms, act.out_rate),
+                        // Short fade-in/out so cue start/stop never click. Not a
+                        // pad-style crossfade — voice is a one-shot.
+                        step: fade_step(50, act.out_rate),
                         remove_when_silent: false,
                     };
-                    let _ = act.cmd_tx.push(PlayCommand::Crossfade(voice));
-                    // Bump the pad generation, then spawn a watcher tied to
-                    // this generation. If the decoder later exits for any
-                    // reason — natural crossfade-stop, explicit Stop, or an
-                    // error mid-set — the host will see NotifyPadEnded.
-                    // The host only emits EngineEvent::PadEnded when the
-                    // generation still matches: a crossfade or Stop bumps the
-                    // generation first, so those legitimate exits stay quiet.
-                    let my_gen = pad_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = act.cmd_tx.push(PlayCommand::PushCue(voice));
+                    cue_active = true;
+                    let my_gen = cue_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = events.send(EngineEvent::CueStarted);
+                    if duck_click_pref {
+                        let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(true));
+                    }
+                    // Watcher: when the decoder signals "ended", give the audio
+                    // buffer ~300 ms to drain, then post a notification back to
+                    // the engine loop. Routing through the internal notify
+                    // channel (not straight to `events`) is what lets the loop
+                    // clear `cue_active` and lift the click duck before
+                    // broadcasting CueEnded.
                     let watcher_ended = dec.ended;
                     let watcher_notify = notify_tx.clone();
-                    let watcher_gen_arc = pad_generation.clone();
                     std::thread::Builder::new()
-                        .name("pad-watcher".into())
+                        .name("cue-watcher".into())
                         .spawn(move || {
                             while !watcher_ended.load(Ordering::Relaxed) {
-                                std::thread::sleep(Duration::from_millis(200));
+                                std::thread::sleep(Duration::from_millis(100));
                             }
-                            // Skip post if the pad has already been replaced
-                            // (saves a no-op trip through the host loop).
-                            if watcher_gen_arc.load(Ordering::Relaxed) == my_gen {
-                                let _ = watcher_notify.send(HostNotify::PadEnded(my_gen));
-                            }
+                            std::thread::sleep(Duration::from_millis(300));
+                            let _ = watcher_notify.send(HostNotify::CueEnded(my_gen));
                         })
                         .ok();
-                } else {
-                    eprintln!("[audio] Play ignored: no output device configured");
                 }
-            }
-            EngineCommand::Stop => {
-                if let Some(act) = active.as_mut() {
-                    // Invalidate the current pad watcher so its eventual
-                    // PadEnded post is ignored — the user initiated the stop,
-                    // they don't need a redundant "pad ended" event.
-                    pad_generation.fetch_add(1, Ordering::Relaxed);
-                    let step = fade_step(crossfade_ms, act.out_rate);
-                    let _ = act.cmd_tx.push(PlayCommand::FadeOutAll(step));
-                }
-            }
-            EngineCommand::PlayCue(path) => {
-                let Some(act) = active.as_mut() else {
-                    eprintln!("[audio] PlayCue ignored: no output device configured");
-                    // The synthesized temp WAV would normally be deleted by
-                    // decode::spawn's thread on exit (delete_on_exit=true).
-                    // We never reach that path here, so clean up directly
-                    // instead of leaking the file in %TEMP%.
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                };
-                let dec = decode::spawn(path, act.out_rate, false, true);
-                let voice = Voice {
-                    consumer: dec.consumer,
-                    stop: dec.stop,
-                    ended: dec.ended.clone(),
-                    bus: VoiceBus::Cue,
-                    gain: 1.0,
-                    target: 1.0,
-                    // Short fade-in/out so cue start/stop never click. Not a
-                    // pad-style crossfade — voice is a one-shot.
-                    step: fade_step(50, act.out_rate),
-                    remove_when_silent: false,
-                };
-                let _ = act.cmd_tx.push(PlayCommand::PushCue(voice));
-                cue_active = true;
-                let my_gen = cue_generation.fetch_add(1, Ordering::Relaxed) + 1;
-                let _ = events.send(EngineEvent::CueStarted);
-                if duck_click_pref {
-                    let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(true));
-                }
-                // Watcher: when the decoder signals "ended", give the audio
-                // buffer ~300 ms to drain, then post a notification back to
-                // the engine loop. Routing through the internal notify
-                // channel (not straight to `events`) is what lets the loop
-                // clear `cue_active` and lift the click duck before
-                // broadcasting CueEnded.
-                let watcher_ended = dec.ended;
-                let watcher_notify = notify_tx.clone();
-                std::thread::Builder::new()
-                    .name("cue-watcher".into())
-                    .spawn(move || {
-                        while !watcher_ended.load(Ordering::Relaxed) {
-                            std::thread::sleep(Duration::from_millis(100));
+                EngineCommand::StopCue => {
+                    if let Some(act) = active.as_mut() {
+                        let step = fade_step(50, act.out_rate);
+                        let _ = act.cmd_tx.push(PlayCommand::StopCue(step));
+                        if cue_active {
+                            cue_active = false;
+                            // Invalidate the current watcher before firing — we're
+                            // emitting CueEnded ourselves and don't want a delayed
+                            // duplicate from the watcher.
+                            cue_generation.fetch_add(1, Ordering::Relaxed);
+                            let _ = events.send(EngineEvent::CueEnded);
                         }
-                        std::thread::sleep(Duration::from_millis(300));
-                        let _ = watcher_notify.send(HostNotify::CueEnded(my_gen));
-                    })
-                    .ok();
-            }
-            EngineCommand::StopCue => {
-                if let Some(act) = active.as_mut() {
-                    let step = fade_step(50, act.out_rate);
-                    let _ = act.cmd_tx.push(PlayCommand::StopCue(step));
-                    if cue_active {
-                        cue_active = false;
-                        // Invalidate the current watcher before firing — we're
-                        // emitting CueEnded ourselves and don't want a delayed
-                        // duplicate from the watcher.
-                        cue_generation.fetch_add(1, Ordering::Relaxed);
-                        let _ = events.send(EngineEvent::CueEnded);
-                    }
-                    if duck_click_pref {
-                        let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(false));
+                        if duck_click_pref {
+                            let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(false));
+                        }
                     }
                 }
-            }
-            EngineCommand::SetVolume(v) => {
-                master = v;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetMaster(v));
+                EngineCommand::SetVolume(v) => {
+                    master = v;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act.cmd_tx.push(PlayCommand::SetMaster(v));
+                    }
                 }
-            }
-            EngineCommand::SetCueVolume(v) => {
-                cue_volume = v;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetCueVolume(v));
+                EngineCommand::SetCueVolume(v) => {
+                    cue_volume = v;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act.cmd_tx.push(PlayCommand::SetCueVolume(v));
+                    }
                 }
-            }
-            EngineCommand::SetCrossfade(ms) => {
-                crossfade_ms = ms.max(1);
-            }
-            EngineCommand::SetClickEnabled(en) => {
-                click_enabled = en;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetClickEnabled(en));
+                EngineCommand::SetCrossfade(ms) => {
+                    crossfade_ms = ms.max(1);
                 }
-            }
-            EngineCommand::SetClickBpm(bpm) => {
-                click_bpm = bpm;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetClickBpm(bpm));
+                EngineCommand::SetClickEnabled(en) => {
+                    click_enabled = en;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act.cmd_tx.push(PlayCommand::SetClickEnabled(en));
+                    }
                 }
-            }
-            EngineCommand::SetClickBeats(b) => {
-                click_beats = b;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetClickBeats(b));
+                EngineCommand::SetClickBpm(bpm) => {
+                    click_bpm = bpm;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act.cmd_tx.push(PlayCommand::SetClickBpm(bpm));
+                    }
                 }
-            }
-            EngineCommand::SetClickAccent(a) => {
-                click_accent = a;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetClickAccent(a));
+                EngineCommand::SetClickBeats(b) => {
+                    click_beats = b;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act.cmd_tx.push(PlayCommand::SetClickBeats(b));
+                    }
                 }
-            }
-            EngineCommand::SetClickVolume(v) => {
-                click_volume = v;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetClickVolume(v));
+                EngineCommand::SetClickAccent(a) => {
+                    click_accent = a;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act.cmd_tx.push(PlayCommand::SetClickAccent(a));
+                    }
                 }
-            }
-            EngineCommand::SetDuckClick(pref) => {
-                duck_click_pref = pref;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(pref && cue_active));
+                EngineCommand::SetClickVolume(v) => {
+                    click_volume = v;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act.cmd_tx.push(PlayCommand::SetClickVolume(v));
+                    }
                 }
-            }
+                EngineCommand::SetDuckClick(pref) => {
+                    duck_click_pref = pref;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act
+                            .cmd_tx
+                            .push(PlayCommand::SetClickDuckActive(pref && cue_active));
+                    }
+                }
+                EngineCommand::RunOutputTest { reply } => {
+                    let Some(act) = active.as_mut() else {
+                        let _ = reply.send(Err(
+                            "audio output not ready - set an output device first".into(),
+                        ));
+                        continue;
+                    };
+
+                    let frames = (act.out_rate as f32 * 1.5) as u64;
+                    let callback_calls = Arc::new(AtomicU64::new(0));
+                    let total_frames = Arc::new(AtomicU64::new(0));
+                    let nonzero_frames = Arc::new(AtomicU64::new(0));
+                    let peak_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+                    let tone = DiagnosticTone {
+                        phase: 0.0,
+                        phase_inc: std::f32::consts::TAU * 440.0 / act.out_rate as f32,
+                        frames_left: frames,
+                        total_frames: total_frames.clone(),
+                        nonzero_frames: nonzero_frames.clone(),
+                        callback_calls: callback_calls.clone(),
+                        peak_bits: peak_bits.clone(),
+                    };
+
+                    if act
+                        .cmd_tx
+                        .push(PlayCommand::StartDiagnosticTone(tone))
+                        .is_err()
+                    {
+                        let _ = reply.send(Err("audio callback command queue is full".into()));
+                        continue;
+                    }
+
+                    let info = act.debug.clone();
+                    std::thread::Builder::new()
+                        .name("audio-debug-report".into())
+                        .spawn(move || {
+                            std::thread::sleep(Duration::from_millis(1800));
+                            let report = AudioDebugReport {
+                                host: info.host,
+                                device: info.device,
+                                sample_format: info.sample_format,
+                                sample_rate: info.sample_rate,
+                                channels: info.channels,
+                                pad_channels: info.pad_channels,
+                                callback_calls: callback_calls.load(Ordering::Relaxed),
+                                frames_written: total_frames.load(Ordering::Relaxed),
+                                nonzero_frames: nonzero_frames.load(Ordering::Relaxed),
+                                peak: f32::from_bits(peak_bits.load(Ordering::Relaxed)),
+                            };
+                            let _ = reply.send(Ok(report));
+                        })
+                        .ok();
+                }
             }
         } else if i == notify_idx {
             let n = match oper.recv(&notify_rx) {
@@ -1049,6 +1182,10 @@ fn host_thread(
                     // the generation so subsequent state changes don't fire
                     // again for the same voice.
                     pad_generation.fetch_add(1, Ordering::Relaxed);
+                    // The pad is no longer playing (file moved, share dropped),
+                    // so drop it from auto-restore — re-spawning on the next
+                    // device switch would just fail the same way.
+                    current_pad = None;
                     let _ = events.send(EngineEvent::PadEnded);
                 }
             }
@@ -1056,60 +1193,53 @@ fn host_thread(
     }
 }
 
-/// Pick a usable supported config: prefer f32 (matches WASAPI default), fall
-/// back to i32 (typical for ASIO drivers). Anything else is rejected.
-/// Choose the stream config to open a device with.
-///
-/// The device's *default* config is the right answer for almost every device:
-/// it carries the full physical channel count, the driver's current sample rate
-/// (so we don't force an ASIO clock change that can fail or glitch other apps),
-/// and the native sample format. We only fall back to scanning `supported_output_configs`
-/// when the default's format isn't one we can feed (we render f32/i32).
-///
-/// History: the old code took the *first* matching config from
-/// `supported_output_configs()`. That worked on WASAPI (whose first config is the
-/// stereo mix format) but broke every ASIO device — cpal's ASIO backend
-/// enumerates configs starting at **1 channel**, so the first match was mono and
-/// the pad bus on channels (0,1) was rejected as "out of range". Selecting by max
-/// channel count (and preferring the native default) is what makes ASIO work.
+/// Pick a usable output config. ASIO's `supported_output_configs()` in cpal
+/// synthesizes one config for every channel count from 1..=device outputs, so
+/// grabbing the first matching format can accidentally open a 1-channel stream
+/// on a 32-out mixer. Prefer the driver's current/default config, which is what
+/// DAWs typically use and what fixed-rate devices like the DL32S report as
+/// 32ch @ 48 kHz.
 fn pick_supported(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, String> {
-    // 1. Prefer the driver's own default — full channels, native rate + format.
-    if let Ok(cfg) = device.default_output_config() {
-        if matches!(cfg.sample_format(), SampleFormat::F32 | SampleFormat::I32) {
-            return Ok(cfg);
-        }
+    let fallback = device
+        .default_output_config()
+        .map_err(|e| format!("default config: {e}"))?;
+    if matches!(
+        fallback.sample_format(),
+        SampleFormat::F32 | SampleFormat::I32
+    ) {
+        return Ok(fallback);
     }
 
-    // 2. Otherwise scan: among f32 (preferred) then i32 ranges, take the one
-    //    with the MOST channels so multi-out routing has room to land. Pin the
-    //    rate to the device default when that rate is offered, else max.
     let configs: Vec<_> = device
         .supported_output_configs()
         .map_err(|e| format!("supported configs: {e}"))?
         .collect();
-    let default_rate = device.default_output_config().ok().map(|c| c.sample_rate());
 
-    let pick = |fmt: SampleFormat| -> Option<cpal::SupportedStreamConfig> {
-        let range = configs
-            .iter()
-            .filter(|c| c.sample_format() == fmt)
-            .max_by_key(|c| c.channels())?;
-        // Use the device's default rate if this range covers it, else its max.
-        let cfg = match default_rate {
-            Some(r) if r >= range.min_sample_rate() && r <= range.max_sample_rate() => {
-                range.clone().with_sample_rate(r)
-            }
-            _ => range.clone().with_max_sample_rate(),
+    // Fallback for hosts whose default config is odd but supported ranges are
+    // richer. Prefer the most channels, then 48 kHz if present, then f32/i32.
+    let mut candidates: Vec<_> = configs
+        .iter()
+        .filter(|c| matches!(c.sample_format(), SampleFormat::F32 | SampleFormat::I32))
+        .map(|c| c.with_max_sample_rate())
+        .collect();
+    candidates.sort_by_key(|c| {
+        let fmt_score = match c.sample_format() {
+            SampleFormat::F32 => 2,
+            SampleFormat::I32 => 1,
+            _ => 0,
         };
-        Some(cfg)
-    };
+        let rate_score = u8::from(c.sample_rate().0 == 48_000);
+        (c.channels(), rate_score, fmt_score)
+    });
 
-    pick(SampleFormat::F32)
-        .or_else(|| pick(SampleFormat::I32))
-        .ok_or_else(|| {
-            "device exposes no f32/i32 output config — cpal can only feed those formats"
-                .to_string()
-        })
+    if let Some(c) = candidates.pop() {
+        Ok(c)
+    } else {
+        Err(format!(
+            "device sample format {:?} is not supported (need f32 or i32)",
+            fallback.sample_format()
+        ))
+    }
 }
 
 /// A stereo bus's routing: physical channel indexes on the output device.
@@ -1151,7 +1281,7 @@ struct ChannelLayout {
 }
 
 /// A deliberately-different, always-valid routing used to "wiggle" an ASIO
-/// driver during a cold-open prime (see `build_stream_primed`): every bus
+/// driver during a cold-open prime (see `build_stream_live`): every bus
 /// collapsed onto a single channel. Channel 0 exists on every device; if the
 /// real pad pair is already there we use channel 1 instead, so the routing the
 /// driver sees genuinely changes (the prime relies on the layout differing).
@@ -1164,95 +1294,6 @@ fn decoy_layout(real: ChannelLayout) -> ChannelLayout {
     }
 }
 
-/// Like `build_stream`, but on a *cold* ASIO open it replays the manual cure for
-/// the "no signal until I change a channel" bug.
-///
-/// A cold first open of an ASIO driver routinely comes up "alive-but-silent":
-/// the stream opens and `play()` succeeds, yet no audio reaches the hardware
-/// until the routing is torn down and actually changed. A manual channel change
-/// cures it only because it reopens after a running stream; on boot there is no
-/// prior stream, so the cold open is trusted as-is and stays silent. Reproduce,
-/// in code, the exact sequence that works by hand ("go to channel 1, then back
-/// to the appropriate channel"): open on the real routing and let it run, reopen
-/// on a decoy routing and let it run, then reopen on the real routing — the open
-/// that finally routes audio. Nothing is audible during the first two steps: at
-/// a cold open no pad/cue voice exists yet and the click boots disabled.
-///
-/// `cold_open` is true only when the host thread held no live stream beforehand
-/// (boot auto-restore, or selecting a device when none was open). Warm reopens
-/// and every WASAPI open fall straight through to a plain `build_stream`, so
-/// they pay none of this cost.
-#[allow(clippy::too_many_arguments)]
-fn build_stream_primed(
-    host_label: &str,
-    device_name: &str,
-    channels: ChannelLayout,
-    master: f32,
-    cue_volume: f32,
-    click_init: ClickInit,
-    buffer_frames: &Arc<AtomicU32>,
-    cold_open: bool,
-) -> Result<ActiveStream, String> {
-    if !(cold_open && host_label.eq_ignore_ascii_case("ASIO")) {
-        return build_stream(
-            host_label,
-            device_name,
-            channels,
-            master,
-            cue_volume,
-            click_init,
-            buffer_frames,
-        );
-    }
-
-    let decoy = decoy_layout(channels);
-    crate::linfo!(
-        "[audio] priming cold ASIO open of '{device_name}': real -> decoy {decoy:?} -> real"
-    );
-
-    let warm = build_stream(
-        host_label,
-        device_name,
-        channels,
-        master,
-        cue_volume,
-        click_init,
-        buffer_frames,
-    )?;
-    std::thread::sleep(COLD_OPEN_WARMUP);
-    drop(warm);
-    std::thread::sleep(COLD_OPEN_REOPEN_SETTLE);
-
-    // The decoy build can legitimately fail (e.g. a 1-channel device); if it
-    // does, skip the wiggle and just reopen on the real layout below.
-    match build_stream(
-        host_label,
-        device_name,
-        decoy,
-        master,
-        cue_volume,
-        click_init,
-        buffer_frames,
-    ) {
-        Ok(decoy_stream) => {
-            std::thread::sleep(COLD_OPEN_WARMUP);
-            drop(decoy_stream);
-            std::thread::sleep(COLD_OPEN_REOPEN_SETTLE);
-        }
-        Err(e) => crate::lerror!("[audio] cold-open decoy reopen skipped: {e}"),
-    }
-
-    build_stream(
-        host_label,
-        device_name,
-        channels,
-        master,
-        cue_volume,
-        click_init,
-        buffer_frames,
-    )
-}
-
 fn build_stream(
     host_label: &str,
     device_name: &str,
@@ -1260,18 +1301,7 @@ fn build_stream(
     master: f32,
     cue_volume: f32,
     click_init: ClickInit,
-    buffer_frames: &Arc<AtomicU32>,
 ) -> Result<ActiveStream, String> {
-    crate::linfo!(
-        "[audio] opening {host_label}/{device_name} — pad={:?} click={:?} cue={:?}",
-        channels.pad,
-        channels.click,
-        channels.cue
-    );
-    // A fresh open hasn't produced a callback yet; clear the stale buffer size
-    // so `active_output` doesn't report the previous device's value.
-    buffer_frames.store(0, Ordering::Relaxed);
-
     let host = host_from_label(host_label)?;
     let device = host
         .output_devices()
@@ -1284,21 +1314,13 @@ fn build_stream(
     let config: cpal::StreamConfig = supported.config();
     let total_channels = config.channels as usize;
     let out_rate = config.sample_rate.0;
-    crate::linfo!(
-        "[audio] {device_name}: selected {total_channels} ch @ {out_rate} Hz, {sample_format:?}"
-    );
     let (pad_l, pad_r) = channels.pad;
     let (click_l, click_r) = channels.click;
     let (cue_l, cue_r) = channels.cue;
 
     if pad_l >= total_channels || pad_r >= total_channels {
-        // With a healthy multi-out device this can't happen (pad defaults to
-        // 0/1). It only fires if the driver opened with <2 outputs — usually an
-        // ASIO control-panel set to mono. Say so instead of a bare index error.
         return Err(format!(
-            "pad channels ({pad_l},{pad_r}) don't fit — {device_name} opened with only \
-             {total_channels} output channel(s). Open the device's ASIO control panel and \
-             enable at least 2 outputs."
+            "pad channel pair ({pad_l},{pad_r}) out of range; device has {total_channels} channels"
         ));
     }
     // Click and cue channels are allowed to be out of range — the callback
@@ -1315,21 +1337,26 @@ fn build_stream(
     };
 
     let click_gen = ClickGen::new(out_rate, click_init);
+    eprintln!(
+        "[audio] opening {host_label} '{device_name}' format={sample_format:?} rate={out_rate} channels={total_channels} pad=({pad_l},{pad_r}) click=({click_l},{click_r}) cue=({cue_l},{cue_r})"
+    );
 
     // Lock-free queue: host thread → real-time callback.
     let (cmd_tx, cmd_rx) = RingBuffer::<PlayCommand>::new(64);
 
-    let err_fn = |err| crate::lerror!("[audio] stream runtime error: {err}");
-    let bf = buffer_frames.clone();
+    // Callback liveness counter (see `ActiveStream::heartbeat`).
+    let heartbeat = Arc::new(AtomicU64::new(0));
+
+    let err_fn = |err| eprintln!("[audio] stream error: {err}");
     let stream = match sample_format {
         SampleFormat::F32 => {
-            let cb = build_callback_f32(layout, master, cue_volume, click_gen, cmd_rx, bf);
+            let cb = build_callback_f32(layout, master, cue_volume, click_gen, cmd_rx, heartbeat.clone());
             device
                 .build_output_stream(&config, cb, err_fn, None)
                 .map_err(|e| format!("build output stream (f32): {e}"))?
         }
         SampleFormat::I32 => {
-            let cb = build_callback_i32(layout, master, cue_volume, click_gen, cmd_rx, bf);
+            let cb = build_callback_i32(layout, master, cue_volume, click_gen, cmd_rx, heartbeat.clone());
             device
                 .build_output_stream(&config, cb, err_fn, None)
                 .map_err(|e| format!("build output stream (i32): {e}"))?
@@ -1337,28 +1364,141 @@ fn build_stream(
         other => return Err(format!("unsupported sample format {other:?}")),
     };
 
-    stream
-        .play()
-        .map_err(|e| format!("start stream: {e}"))?;
+    stream.play().map_err(|e| format!("start stream: {e}"))?;
 
-    crate::linfo!("[audio] stream live on {host_label}/{device_name}");
     Ok(ActiveStream {
         _stream: stream,
         cmd_tx,
         out_rate,
-        info: ActiveOutput {
+        heartbeat,
+        debug: StreamDebugInfo {
             host: host_label.to_string(),
             device: device_name.to_string(),
-            channels: total_channels,
+            sample_format: format!("{sample_format:?}"),
             sample_rate: out_rate,
-            sample_format: match sample_format {
-                SampleFormat::F32 => "f32".to_string(),
-                SampleFormat::I32 => "i32".to_string(),
-                other => format!("{other:?}"),
-            },
-            buffer_frames: None,
+            channels: total_channels,
+            pad_channels: channels.pad,
         },
     })
+}
+
+/// How long to wait for the freshly-built stream's callback to fire at least
+/// once before declaring it dead. A healthy driver fires within a few ms; ASIO
+/// devices that opened dead never fire at all.
+const LIVENESS_POLL_STEP: Duration = Duration::from_millis(25);
+const LIVENESS_POLL_STEPS: u32 = 16; // 16 × 25 ms = up to 400 ms
+
+/// Settle delays (ms) before each successive reopen when a stream comes up
+/// dead. Increasing backoff: some ASIO drivers wake on a near-immediate
+/// teardown+rebuild, others only relinquish/restart the device after real
+/// wall-clock time has passed since the failed open. The schedule's length also
+/// sets how many reopen attempts we make on top of the initial open.
+const DEAD_STREAM_REOPEN_BACKOFF_MS: [u64; 4] = [150, 400, 900, 1600];
+
+/// Wait until the stream's callback has fired (driver is genuinely running), or
+/// give up after the poll budget. Returns true if at least one callback ran.
+fn stream_is_live(act: &ActiveStream) -> bool {
+    let start = act.heartbeat.load(Ordering::Relaxed);
+    for _ in 0..LIVENESS_POLL_STEPS {
+        std::thread::sleep(LIVENESS_POLL_STEP);
+        if act.heartbeat.load(Ordering::Relaxed) > start {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build a stream and confirm the driver actually started firing callbacks,
+/// reopening if it came up dead. This is the generic cure for the "no signal
+/// until I change a channel" symptom: an ASIO device can accept the stream and
+/// report `play()` success yet never run a single callback, so audio is silent
+/// until the stream is torn down and rebuilt. Each retry releases the prior
+/// attempt (single-client drivers can't be double-opened) and waits the ASIO
+/// settle interval before reopening.
+///
+/// `cold_open` is true when this is the first stream of the session for the
+/// driver — i.e. the host thread held no live stream beforehand (boot
+/// auto-restore, or selecting a device when none was open). See the cold-open
+/// prime below for why that case needs special handling.
+fn build_stream_live(
+    host_label: &str,
+    device_name: &str,
+    channels: ChannelLayout,
+    master: f32,
+    cue_volume: f32,
+    click_init: ClickInit,
+    cold_open: bool,
+) -> Result<ActiveStream, String> {
+    let mut stream = build_stream(host_label, device_name, channels, master, cue_volume, click_init)?;
+
+    // A *cold* first open of an ASIO driver is the unreliable one. The driver
+    // accepts the stream and fires its data callback (so `heartbeat` ticks and
+    // `stream_is_live` returns true), yet routes no audio to the hardware until
+    // its buffers are torn down and re-prepared — it comes up "alive-but-silent".
+    // That is the "no signal until I change a channel" bug: a manual channel
+    // change works only because it drops a prior running stream and reopens, so
+    // its open is the *second* (warm) one. On boot there is no prior stream, so
+    // the cold open is trusted as-is and stays silent.
+    //
+    // Replicate, in code, the exact sequence that works by hand ("go to channel
+    // 1, then back to the appropriate channel"). A same-config reopen is not
+    // enough for Voicemeeter's Virtual ASIO — the routing must actually change
+    // and change back:
+    //   1. let the initial (silent) cold stream run so the driver fully starts,
+    //   2. reopen on a decoy routing, let it run,
+    //   3. reopen on the real routing — the open that finally routes audio.
+    // Nothing is audible during 1–2: at a cold open no pad/cue voice exists yet
+    // and the click boots disabled. Gated on a genuinely cold open AND ASIO, so
+    // WASAPI is untouched and a warm channel change never pays this cost.
+    if cold_open && host_label.eq_ignore_ascii_case("ASIO") {
+        let decoy = decoy_layout(channels);
+        eprintln!(
+            "[audio] priming cold ASIO open of '{device_name}': real -> decoy {decoy:?} -> real"
+        );
+        let _ = stream_is_live(&stream);
+        std::thread::sleep(COLD_OPEN_WARMUP);
+        drop(stream);
+        std::thread::sleep(COLD_OPEN_REOPEN_SETTLE);
+
+        // The decoy build can legitimately fail (e.g. a 1-channel device); if it
+        // does, skip the wiggle and just reopen on the real layout below.
+        match build_stream(host_label, device_name, decoy, master, cue_volume, click_init) {
+            Ok(decoy_stream) => {
+                let _ = stream_is_live(&decoy_stream);
+                std::thread::sleep(COLD_OPEN_WARMUP);
+                drop(decoy_stream);
+                std::thread::sleep(COLD_OPEN_REOPEN_SETTLE);
+            }
+            Err(e) => eprintln!("[audio] cold-open decoy reopen skipped: {e}"),
+        }
+
+        stream =
+            build_stream(host_label, device_name, channels, master, cue_volume, click_init)?;
+    }
+
+    if stream_is_live(&stream) {
+        return Ok(stream);
+    }
+    let attempts = DEAD_STREAM_REOPEN_BACKOFF_MS.len();
+    for (i, &settle_ms) in DEAD_STREAM_REOPEN_BACKOFF_MS.iter().enumerate() {
+        eprintln!(
+            "[audio] '{device_name}' opened but no callbacks fired — reopening after {settle_ms}ms (attempt {}/{attempts})",
+            i + 1
+        );
+        // Drop releases the dead stream (and its driver claim) before we retry.
+        drop(stream);
+        std::thread::sleep(Duration::from_millis(settle_ms));
+        stream = build_stream(host_label, device_name, channels, master, cue_volume, click_init)?;
+        if stream_is_live(&stream) {
+            eprintln!("[audio] '{device_name}' is now live after reopen");
+            return Ok(stream);
+        }
+    }
+    // Still no heartbeat after retries. Hand back the last stream anyway rather
+    // than dropping audio entirely — better a possibly-silent stream the user
+    // can re-poke than a hard failure, and a few drivers under-report.
+    eprintln!("[audio] '{device_name}' still reported no callbacks after reopen attempts");
+    Ok(stream)
 }
 
 /// Synthesized click. Lives entirely inside the real-time callback: no
@@ -1375,10 +1515,10 @@ struct ClickGen {
     beat_index: u32,
     // Active ping voice (one at a time — at 300 BPM the prior ping is long gone
     // before the next one fires).
-    osc_phase: f32,    // radians, wraps at 2π
-    osc_freq: f32,     // Hz
-    osc_env: f32,      // current envelope, decays per sample
-    osc_decay: f32,    // per-sample env multiplier
+    osc_phase: f32, // radians, wraps at 2π
+    osc_freq: f32,  // Hz
+    osc_env: f32,   // current envelope, decays per sample
+    osc_decay: f32, // per-sample env multiplier
     // Enable ramp: ~20 ms equal-rate fade in/out to suppress click-on-toggle.
     enable_ramp: f32,
     enable_target: f32,
@@ -1484,11 +1624,8 @@ impl ClickGen {
             self.beat_index = (self.beat_index + 1) % self.beats_per_bar.max(1);
         }
 
-        let s = self.osc_phase.sin()
-            * self.osc_env
-            * self.volume
-            * self.enable_ramp
-            * self.duck_ramp;
+        let s =
+            self.osc_phase.sin() * self.osc_env * self.volume * self.enable_ramp * self.duck_ramp;
         self.osc_phase += std::f32::consts::TAU * self.osc_freq / self.sample_rate;
         if self.osc_phase >= std::f32::consts::TAU {
             self.osc_phase -= std::f32::consts::TAU;
@@ -1566,11 +1703,51 @@ fn mix_one_frame(voices: &mut Vec<Voice>, master: f32, cue_volume: f32) -> Mixed
 }
 
 #[inline]
+fn record_peak(bits: &AtomicU32, value: f32) {
+    let value = value.abs();
+    let mut cur = bits.load(Ordering::Relaxed);
+    while value > f32::from_bits(cur) {
+        match bits.compare_exchange_weak(cur, value.to_bits(), Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(next) => cur = next,
+        }
+    }
+}
+
+#[inline]
+fn add_diagnostic_tone(mix: &mut MixedFrame, diag: &mut Option<DiagnosticTone>) {
+    let Some(tone) = diag.as_mut() else {
+        return;
+    };
+    if tone.frames_left == 0 {
+        *diag = None;
+        return;
+    }
+
+    let value = tone.phase.sin() * 0.35;
+    tone.phase += tone.phase_inc;
+    if tone.phase >= std::f32::consts::TAU {
+        tone.phase -= std::f32::consts::TAU;
+    }
+    tone.frames_left -= 1;
+
+    mix.pad_l += value;
+    mix.pad_r += value;
+    tone.total_frames.fetch_add(1, Ordering::Relaxed);
+    if value != 0.0 {
+        tone.nonzero_frames.fetch_add(1, Ordering::Relaxed);
+    }
+    record_peak(&tone.peak_bits, value);
+}
+
+#[inline]
 fn drain_commands(
     voices: &mut Vec<Voice>,
     master: &mut f32,
     cue_volume: &mut f32,
     click: &mut ClickGen,
+    diagnostic: &mut Option<DiagnosticTone>,
     cmd_rx: &mut rtrb::Consumer<PlayCommand>,
 ) {
     while let Ok(cmd) = cmd_rx.pop() {
@@ -1623,6 +1800,7 @@ fn drain_commands(
             PlayCommand::SetClickAccent(a) => click.set_accent(a),
             PlayCommand::SetClickVolume(v) => click.set_volume(v),
             PlayCommand::SetClickDuckActive(active) => click.set_duck_active(active),
+            PlayCommand::StartDiagnosticTone(tone) => *diagnostic = Some(tone),
         }
     }
 }
@@ -1683,22 +1861,31 @@ fn build_callback_f32(
     cue_volume_init: f32,
     click_init: ClickGen,
     mut cmd_rx: rtrb::Consumer<PlayCommand>,
-    buffer_frames: Arc<AtomicU32>,
+    heartbeat: Arc<AtomicU64>,
 ) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut voices: Vec<Voice> = Vec::with_capacity(4);
     let mut master = master_init;
     let mut cue_volume = cue_volume_init;
     let mut click = click_init;
+    let mut diagnostic: Option<DiagnosticTone> = None;
 
     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-        // Publish the negotiated buffer size (frames) for diagnostics. Cheap,
-        // RT-safe relaxed store; the value only changes if the driver resizes.
-        let frames = (data.len() / layout.total.max(1)) as u32;
-        buffer_frames.store(frames, Ordering::Relaxed);
-        drain_commands(&mut voices, &mut master, &mut cue_volume, &mut click, &mut cmd_rx);
+        heartbeat.fetch_add(1, Ordering::Relaxed);
+        drain_commands(
+            &mut voices,
+            &mut master,
+            &mut cue_volume,
+            &mut click,
+            &mut diagnostic,
+            &mut cmd_rx,
+        );
+        if let Some(tone) = diagnostic.as_ref() {
+            tone.callback_calls.fetch_add(1, Ordering::Relaxed);
+        }
 
         for frame in data.chunks_mut(layout.total) {
-            let m = mix_one_frame(&mut voices, master, cue_volume);
+            let mut m = mix_one_frame(&mut voices, master, cue_volume);
+            add_diagnostic_tone(&mut m, &mut diagnostic);
             let c = click.next_sample();
             write_frame_f32(frame, &layout, &m, c);
         }
@@ -1711,12 +1898,13 @@ fn build_callback_i32(
     cue_volume_init: f32,
     click_init: ClickGen,
     mut cmd_rx: rtrb::Consumer<PlayCommand>,
-    buffer_frames: Arc<AtomicU32>,
+    heartbeat: Arc<AtomicU64>,
 ) -> impl FnMut(&mut [i32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut voices: Vec<Voice> = Vec::with_capacity(4);
     let mut master = master_init;
     let mut cue_volume = cue_volume_init;
     let mut click = click_init;
+    let mut diagnostic: Option<DiagnosticTone> = None;
 
     // i32 full-scale. Headroom of 1 sample on the negative side avoids wrap.
     const SCALE: f32 = 2_147_483_520.0;
@@ -1726,12 +1914,22 @@ fn build_callback_i32(
     let mut scratch = [0.0f32; 64];
 
     move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
-        let frames = (data.len() / layout.total.max(1)) as u32;
-        buffer_frames.store(frames, Ordering::Relaxed);
-        drain_commands(&mut voices, &mut master, &mut cue_volume, &mut click, &mut cmd_rx);
+        heartbeat.fetch_add(1, Ordering::Relaxed);
+        drain_commands(
+            &mut voices,
+            &mut master,
+            &mut cue_volume,
+            &mut click,
+            &mut diagnostic,
+            &mut cmd_rx,
+        );
+        if let Some(tone) = diagnostic.as_ref() {
+            tone.callback_calls.fetch_add(1, Ordering::Relaxed);
+        }
 
         for frame in data.chunks_mut(layout.total) {
-            let m = mix_one_frame(&mut voices, master, cue_volume);
+            let mut m = mix_one_frame(&mut voices, master, cue_volume);
+            add_diagnostic_tone(&mut m, &mut diagnostic);
             let c = click.next_sample();
 
             let n = frame.len().min(scratch.len());

@@ -900,52 +900,6 @@ button {
   margin: 15px 0 0;
 }
 
-/* ── output status line (under the device picker) ───────────────────── */
-.output-status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 12px;
-  padding: 9px 12px;
-  border-radius: 9px;
-  font-size: 12.5px;
-  line-height: 1.4;
-}
-.output-status--ok {
-  background: color-mix(in oklch, var(--accent-ink) 9%, var(--surface));
-  color: var(--accent-ink);
-  border: 1px solid color-mix(in oklch, var(--accent-ink) 22%, transparent);
-}
-.output-status--warn {
-  background: color-mix(in oklch, var(--danger) 10%, var(--surface));
-  color: var(--danger);
-  border: 1px solid color-mix(in oklch, var(--danger) 32%, transparent);
-}
-.output-status-dot {
-  flex: 0 0 auto;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--danger);
-}
-
-/* ── diagnostics report dump ────────────────────────────────────────── */
-.diag-output {
-  margin: 14px 0 0;
-  padding: 12px 14px;
-  max-height: 280px;
-  overflow: auto;
-  border-radius: 9px;
-  background: var(--surface-2, color-mix(in oklch, var(--text-1) 5%, var(--surface)));
-  border: 1px solid color-mix(in oklch, var(--text-1) 12%, transparent);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11.5px;
-  line-height: 1.5;
-  color: var(--text-2);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
 /* ─────────────────────────── click track card ─────────────────────── */
 .bpm {
   display: flex;
