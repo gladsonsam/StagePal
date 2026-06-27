@@ -27,43 +27,54 @@ interface RemoteState {
   info: Info | null;
   now: NowPlaying;
   conn: ConnState;
+  refreshInfo: () => Promise<void>;
 }
 
-// Fetches /api/info once, then mirrors NowPlaying WS broadcasts into state.
-// Auto-reconnects on close.
+// Fetches /api/info, then mirrors NowPlaying WS broadcasts into state.
+// Auto-reconnects on close/error and whenever the page becomes visible again.
 export function useRemoteState(): RemoteState {
   const [info, setInfo] = useState<Info | null>(null);
   const [now, setNow] = useState<NowPlaying>(DEFAULT_NOW);
   const [conn, setConn] = useState<ConnState>("reconnecting");
-  const closedRef = useRef(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    fetchInfo()
+  // Refs let the visibility handler reach into the effect's live state.
+  const wsRef = useRef<WebSocket | null>(null);
+  const timerRef = useRef<number | null>(null);
+  const deadRef = useRef(false);
+  const connectRef = useRef<(() => void) | null>(null);
+
+  function refreshInfo(): Promise<void> {
+    return fetchInfo()
       .then((i) => {
-        if (cancelled) return;
         setInfo(i);
-        setNow(normalize(i.now));
       })
       .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  }
 
   useEffect(() => {
-    let ws: WebSocket | null = null;
-    let reconnectTimer: number | null = null;
-
-    const connect = () => {
+    function connect() {
+      if (deadRef.current) return;
+      if (timerRef.current != null) {
+        window.clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${location.host}/ws`);
-      ws.onopen = () => setConn("connected");
-      ws.onclose = () => {
-        setConn("reconnecting");
-        if (closedRef.current) return;
-        reconnectTimer = window.setTimeout(connect, 1500);
+      const ws = new WebSocket(`${proto}://${location.host}/ws`);
+      wsRef.current = ws;
+      ws.onopen = () => {
+        setConn("connected");
+        // Refresh info so cue list and presets are up-to-date after reconnect.
+        fetchInfo()
+          .then((i) => setInfo(i))
+          .catch(() => {});
       };
+      ws.onclose = () => {
+        if (deadRef.current) return;
+        setConn("reconnecting");
+        timerRef.current = window.setTimeout(connect, 1500);
+      };
+      // onerror always fires before onclose; closing here triggers the retry.
+      ws.onerror = () => ws.close();
       ws.onmessage = (e) => {
         try {
           setNow(normalize(JSON.parse(e.data) as NowPlaying));
@@ -71,17 +82,50 @@ export function useRemoteState(): RemoteState {
           /* ignore malformed frame */
         }
       };
-    };
+    }
 
+    connectRef.current = connect;
+    fetchInfo()
+      .then((i) => {
+        setInfo(i);
+        setNow(normalize(i.now));
+      })
+      .catch(() => {});
     connect();
+
     return () => {
-      closedRef.current = true;
-      if (reconnectTimer != null) window.clearTimeout(reconnectTimer);
-      ws?.close();
+      deadRef.current = true;
+      if (timerRef.current != null) window.clearTimeout(timerRef.current);
+      wsRef.current?.close();
     };
   }, []);
 
-  return { info, now, conn };
+  // When the user switches back to this tab, reconnect and refresh data.
+  useEffect(() => {
+    function onVisibilityChange() {
+      if (document.visibilityState !== "visible") return;
+      fetchInfo()
+        .then((i) => setInfo(i))
+        .catch(() => {});
+      const ws = wsRef.current;
+      const gone =
+        !ws ||
+        ws.readyState === WebSocket.CLOSED ||
+        ws.readyState === WebSocket.CLOSING;
+      if (gone) {
+        if (timerRef.current != null) {
+          window.clearTimeout(timerRef.current);
+          timerRef.current = null;
+        }
+        connectRef.current?.();
+      }
+    }
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () =>
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, []);
+
+  return { info, now, conn, refreshInfo };
 }
 
 /** Backfill click/cue in case an older backend omits them. */

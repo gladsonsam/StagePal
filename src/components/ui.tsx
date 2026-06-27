@@ -441,17 +441,16 @@ export function PadCluster({
     <div className="pad-grid" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
       {NOTES.map((n) => {
         const file = assignments[n];
-        const empty = !file;
+        const synth = !file;
         const active = playing === n;
         return (
           <button
             key={n}
             type="button"
-            className={`pad${active ? " active" : ""}${empty ? " empty" : ""}`}
+            className={`pad${active ? " active" : ""}${synth ? " synth" : ""}`}
             style={{ height: h, padding: big ? "12px 14px" : "10px 12px" }}
-            disabled={empty}
             onClick={() => onTrigger(n)}
-            title={empty ? `${n} — no pad mapped` : `${n} · ${file}`}
+            title={synth ? `${n} — generated pad (no file)` : `${n} · ${file}`}
           >
             <div className="pad-top">
               <span className="pad-note" style={{ fontSize: big ? 24 : 20 }}>
@@ -459,8 +458,8 @@ export function PadCluster({
               </span>
               {active && <Meter live bars={4} h={16} />}
             </div>
-            <span className={`pad-file${file ? " mono" : " empty-label"}`}>
-              {file || "empty"}
+            <span className={`pad-file${file ? " mono" : " synth-label"}`}>
+              {file ?? "generated"}
             </span>
           </button>
         );
@@ -698,10 +697,9 @@ function Piano({
           <div key={n} className="pkey-wrap">
             <button
               type="button"
-              className={`pkey${active ? " active" : ""}`}
-              disabled={!has}
+              className={`pkey${active ? " active" : ""}${has ? "" : " synth"}`}
               onClick={() => onTrigger(n)}
-              title={has ? n : `${n} — no pad mapped`}
+              title={has ? n : `${n} — generated pad (no file)`}
             >
               {active && (
                 <div style={{ marginBottom: 6 }}>
@@ -709,18 +707,17 @@ function Piano({
                 </div>
               )}
               <span className="pkey-note">{n}</span>
-              <span className={`pkey-dot${has ? " has" : ""}`} />
+              <span className={`pkey-dot${has ? " has" : " synth"}`} />
             </button>
             {bn && (
               <button
                 type="button"
-                className={`bkey${bActive ? " active" : ""}`}
-                disabled={!bHas}
+                className={`bkey${bActive ? " active" : ""}${bHas ? "" : " synth"}`}
                 onClick={() => onTrigger(bn)}
-                title={bHas ? bn : `${bn} — no pad mapped`}
+                title={bHas ? bn : `${bn} — generated pad (no file)`}
               >
                 <span className="bkey-note">{bn}</span>
-                <span className={`bkey-dot${bHas ? " has" : ""}`} />
+                <span className={`bkey-dot${bHas ? " has" : " synth"}`} />
               </button>
             )}
           </div>

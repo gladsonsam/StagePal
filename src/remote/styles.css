@@ -574,9 +574,15 @@ h1 {
   box-shadow: none;
   cursor: default;
 }
+.pad.synth {
+  background: var(--surface-2);
+  border-style: dashed;
+  box-shadow: none;
+}
 .pad.active {
   background: color-mix(in oklch, var(--accent) 16%, var(--surface));
   border-color: color-mix(in oklch, var(--accent) 45%, transparent);
+  border-style: solid;
   box-shadow: 0 2px 12px color-mix(in oklch, var(--accent) 20%, transparent);
 }
 .pad-top {
@@ -604,9 +610,10 @@ h1 {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.pad .file.empty {
+.pad .file.synth {
   font-family: var(--sans);
   font-style: italic;
+  color: color-mix(in oklch, var(--accent) 60%, var(--text-3));
 }
 
 /* meter */
@@ -683,6 +690,12 @@ h1 {
 .pkey .dot.has {
   background: var(--accent);
 }
+.pkey .dot.synth {
+  background: color-mix(in oklch, var(--accent) 55%, transparent);
+}
+.pkey.synth {
+  border-style: dashed;
+}
 .bkey {
   position: absolute;
   top: 0;
@@ -722,6 +735,9 @@ h1 {
 }
 .bkey .dot.has {
   background: var(--accent);
+}
+.bkey .dot.synth {
+  background: color-mix(in oklch, var(--accent) 55%, rgba(255, 255, 255, 0.28));
 }
 
 /* volume */
@@ -815,6 +831,194 @@ input[type="range"]::-moz-range-thumb {
   color: var(--text-3);
   margin-top: 8px;
   min-height: 14px;
+}
+
+/* Edit icon overlaid on cue buttons */
+.cue-btn {
+  padding-bottom: 34px; /* room for the pencil icon */
+}
+.cue-btn-edit {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  opacity: 0.55;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+.cue-btn-edit:active {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* "New cue" card — last item in the cue grid */
+.cue-btn-new {
+  display: flex;
+  background: transparent;
+  border-style: dashed;
+  color: var(--text-3);
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  padding-bottom: 14px;
+}
+.cue-btn-new:active {
+  background: var(--surface-2);
+}
+
+/* Empty-state add button */
+.cue-empty-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 46px;
+  padding: 0 20px;
+  border-radius: 13px;
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  margin-top: 8px;
+}
+.cue-empty-add:active {
+  background: var(--surface-2);
+}
+
+/* ─── cue bottom sheet ──────────────────────────────────────── */
+.cue-sheet-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 20;
+  display: flex;
+  align-items: flex-end;
+  animation: fadeOverlay 0.18s ease;
+}
+@keyframes fadeOverlay {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.cue-sheet {
+  width: 100%;
+  background: var(--surface);
+  border-radius: 22px 22px 0 0;
+  border: 1px solid var(--line);
+  border-bottom: none;
+  padding: 22px 20px calc(env(safe-area-inset-bottom, 0px) + 26px);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: slideUpSheet 0.22s ease;
+}
+@keyframes slideUpSheet {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0); }
+}
+.cue-sheet-title {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  margin: 0 0 2px;
+}
+.cue-sheet-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cue-sheet-lbl {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-3);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+.cue-sheet-input,
+.cue-sheet-textarea {
+  width: 100%;
+  padding: 10px 13px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--inset);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.4;
+  -webkit-appearance: none;
+}
+.cue-sheet-input:focus,
+.cue-sheet-textarea:focus {
+  outline: none;
+  border-color: color-mix(in oklch, var(--accent) 55%, var(--line));
+}
+.cue-sheet-textarea {
+  resize: vertical;
+  min-height: 72px;
+}
+.cue-sheet-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.sheet-btn {
+  flex: 1;
+  height: 48px;
+  border-radius: 13px;
+  font-family: var(--sans);
+  font-size: 15px;
+  font-weight: 600;
+  border: 1px solid transparent;
+  cursor: pointer;
+  min-width: 80px;
+}
+.sheet-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.sheet-btn-primary {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+.sheet-btn-primary:disabled {
+  background: var(--surface-2);
+  color: var(--text-3);
+  border-color: var(--line);
+}
+.sheet-btn-cancel {
+  background: var(--surface-2);
+  color: var(--text-2);
+  border-color: var(--line);
+}
+.sheet-btn-delete {
+  background: color-mix(in oklch, var(--danger) 12%, var(--surface));
+  color: var(--danger);
+  border-color: color-mix(in oklch, var(--danger) 34%, transparent);
+  flex: none;
+  min-width: 90px;
+}
+
+/* ─── tablet / iPad: fill the available width ───────────────── */
+@media (min-width: 600px) {
+  #root {
+    max-width: min(820px, 100vw);
+    padding-left: max(24px, env(safe-area-inset-left));
+    padding-right: max(24px, env(safe-area-inset-right));
+  }
+  .cue-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
 }
 
 /* Short portrait screens (smaller iPhones, browsers with thick chrome) —

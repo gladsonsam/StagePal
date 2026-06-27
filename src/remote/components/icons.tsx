@@ -173,6 +173,23 @@ export function CuesTabIcon() {
   );
 }
 
+export function PencilIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 20 20" aria-hidden>
+      <g
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M14.5 3.5l2 2-10 10H4.5v-2l10-10z" />
+        <path d="M12.5 5.5l2 2" />
+      </g>
+    </svg>
+  );
+}
+
 export function ChevUpIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 20 20" aria-hidden>

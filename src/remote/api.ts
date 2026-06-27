@@ -25,6 +25,33 @@ export interface Info {
   now: NowPlaying;
 }
 
+export async function cueAdd(label: string, text: string): Promise<QuickCue> {
+  const r = await fetch("/api/cue/add", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ label, text }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<QuickCue>;
+}
+
+export async function cueUpdate(
+  id: string,
+  label: string,
+  text: string,
+): Promise<void> {
+  const r = await fetch(`/api/cue/update/${encodeURIComponent(id)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ label, text }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export async function cueRemove(id: string): Promise<void> {
+  await fetch(`/api/cue/remove/${encodeURIComponent(id)}`, { method: "POST" });
+}
+
 export function post(path: string, body?: unknown): Promise<void> {
   return fetch(path, {
     method: "POST",

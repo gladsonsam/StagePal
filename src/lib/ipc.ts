@@ -17,7 +17,7 @@ function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   return tauriInvoke<T>(cmd, args);
 }
 
-export { ALL_KEYS } from "../shared/types";
+export { ALL_KEYS, BUILTIN_SYNTH_ID } from "../shared/types";
 export type { Key, ClickNow, CueNow, NowPlaying } from "../shared/types";
 
 export interface DeviceInfo {

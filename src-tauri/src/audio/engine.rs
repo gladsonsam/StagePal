@@ -37,7 +37,7 @@ fn await_stream_reply(rx: &Receiver<Result<(), String>>, busy: bool) -> Result<(
     }
 }
 
-use super::decode;
+use super::{decode, synth};
 
 /// Output device info for the UI device/channel pickers.
 #[derive(Debug, Clone, Serialize)]
@@ -154,6 +154,7 @@ enum EngineCommand {
         reply: Sender<Result<(), String>>,
     },
     Play(PathBuf),
+    PlaySynth(f32),
     Stop,
     PlayCue(PathBuf),
     StopCue,
@@ -391,6 +392,15 @@ impl AudioEngine {
             .map_err(|_| "audio host thread is gone".to_string())
     }
 
+    pub fn play_synth(&self, root_hz: f32) -> Result<(), String> {
+        if !self.has_active.load(Ordering::Relaxed) {
+            return Err("audio output not ready — set or restore an output device first".into());
+        }
+        self.tx
+            .send(EngineCommand::PlaySynth(root_hz))
+            .map_err(|_| "audio host thread is gone".to_string())
+    }
+
     pub fn stop(&self) -> Result<(), String> {
         self.tx
             .send(EngineCommand::Stop)
@@ -592,6 +602,42 @@ fn start_pad_voice(
         .ok();
 }
 
+fn start_synth_voice(
+    act: &mut ActiveStream,
+    root_hz: f32,
+    fade_in_ms: u32,
+    pad_generation: &Arc<AtomicU64>,
+    notify_tx: &Sender<HostNotify>,
+) {
+    let dec = synth::spawn(root_hz, act.out_rate);
+    let voice = Voice {
+        consumer: dec.consumer,
+        stop: dec.stop,
+        ended: dec.ended.clone(),
+        bus: VoiceBus::Pad,
+        gain: 0.0,
+        target: 1.0,
+        step: fade_step(fade_in_ms, act.out_rate),
+        remove_when_silent: false,
+    };
+    let _ = act.cmd_tx.push(PlayCommand::Crossfade(voice));
+    let my_gen = pad_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    let watcher_ended = dec.ended;
+    let watcher_notify = notify_tx.clone();
+    let watcher_gen_arc = pad_generation.clone();
+    std::thread::Builder::new()
+        .name("pad-watcher".into())
+        .spawn(move || {
+            while !watcher_ended.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            if watcher_gen_arc.load(Ordering::Relaxed) == my_gen {
+                let _ = watcher_notify.send(HostNotify::PadEnded(my_gen));
+            }
+        })
+        .ok();
+}
+
 fn host_thread(
     rx: Receiver<EngineCommand>,
     notify_rx: Receiver<HostNotify>,
@@ -615,7 +661,9 @@ fn host_thread(
     };
     // Pad currently looping, if any. Tracked so a stream rebuild (which drops all
     // voices) can re-spawn it and keep playback going instead of going silent.
+    // Exactly one of these is Some when a pad is playing; the other is None.
     let mut current_pad: Option<PathBuf> = None;
+    let mut current_synth_freq: Option<f32> = None;
     // Click shadow, re-applied on every rebuild. `enabled` is deliberately not
     // seeded from settings on boot (no surprise live click on launch).
     let mut click_enabled: bool = false;
@@ -707,14 +755,12 @@ fn host_thread(
                             active = Some(stream);
                             has_active.store(true, Ordering::Relaxed);
                             // Re-spawn the prior pad so the switch is seamless.
-                            if let (Some(act), Some(path)) = (active.as_mut(), current_pad.clone()) {
-                                start_pad_voice(
-                                    act,
-                                    path,
-                                    RESTORE_FADE_MS,
-                                    &pad_generation,
-                                    &notify_tx,
-                                );
+                            if let Some(act) = active.as_mut() {
+                                if let Some(path) = current_pad.clone() {
+                                    start_pad_voice(act, path, RESTORE_FADE_MS, &pad_generation, &notify_tx);
+                                } else if let Some(freq) = current_synth_freq {
+                                    start_synth_voice(act, freq, RESTORE_FADE_MS, &pad_generation, &notify_tx);
+                                }
                             }
                             let _ = reply.send(Ok(()));
                         }
@@ -777,14 +823,12 @@ fn host_thread(
                             active = Some(stream);
                             has_active.store(true, Ordering::Relaxed);
                             // Re-spawn the prior pad so the switch is seamless.
-                            if let (Some(act), Some(path)) = (active.as_mut(), current_pad.clone()) {
-                                start_pad_voice(
-                                    act,
-                                    path,
-                                    RESTORE_FADE_MS,
-                                    &pad_generation,
-                                    &notify_tx,
-                                );
+                            if let Some(act) = active.as_mut() {
+                                if let Some(path) = current_pad.clone() {
+                                    start_pad_voice(act, path, RESTORE_FADE_MS, &pad_generation, &notify_tx);
+                                } else if let Some(freq) = current_synth_freq {
+                                    start_synth_voice(act, freq, RESTORE_FADE_MS, &pad_generation, &notify_tx);
+                                }
                             }
                             let _ = reply.send(Ok(()));
                         }
@@ -845,14 +889,12 @@ fn host_thread(
                             active = Some(stream);
                             has_active.store(true, Ordering::Relaxed);
                             // Re-spawn the prior pad so the switch is seamless.
-                            if let (Some(act), Some(path)) = (active.as_mut(), current_pad.clone()) {
-                                start_pad_voice(
-                                    act,
-                                    path,
-                                    RESTORE_FADE_MS,
-                                    &pad_generation,
-                                    &notify_tx,
-                                );
+                            if let Some(act) = active.as_mut() {
+                                if let Some(path) = current_pad.clone() {
+                                    start_pad_voice(act, path, RESTORE_FADE_MS, &pad_generation, &notify_tx);
+                                } else if let Some(freq) = current_synth_freq {
+                                    start_synth_voice(act, freq, RESTORE_FADE_MS, &pad_generation, &notify_tx);
+                                }
                             }
                             let _ = reply.send(Ok(()));
                         }
@@ -867,16 +909,26 @@ fn host_thread(
                 }
                 EngineCommand::Play(path) => {
                     if let Some(act) = active.as_mut() {
-                        // Remember the pad so a later rebuild can re-spawn it.
                         current_pad = Some(path.clone());
+                        current_synth_freq = None;
                         start_pad_voice(act, path, crossfade_ms, &pad_generation, &notify_tx);
                     } else {
                         eprintln!("[audio] Play ignored: no output device configured");
                     }
                 }
+                EngineCommand::PlaySynth(root_hz) => {
+                    if let Some(act) = active.as_mut() {
+                        current_pad = None;
+                        current_synth_freq = Some(root_hz);
+                        start_synth_voice(act, root_hz, crossfade_ms, &pad_generation, &notify_tx);
+                    } else {
+                        eprintln!("[audio] PlaySynth ignored: no output device configured");
+                    }
+                }
                 EngineCommand::Stop => {
                     // User stop — don't auto-restore on the next rebuild.
                     current_pad = None;
+                    current_synth_freq = None;
                     if let Some(act) = active.as_mut() {
                         // Invalidate the watcher so its PadEnded post is ignored.
                         pad_generation.fetch_add(1, Ordering::Relaxed);

@@ -77,6 +77,24 @@ impl Key {
         }
     }
 
+    /// Fundamental frequency in the 3rd octave (C3 = 130.81 Hz).
+    pub fn freq(self) -> f32 {
+        match self {
+            Key::C  => 130.81,
+            Key::Cs => 138.59,
+            Key::D  => 146.83,
+            Key::Ds => 155.56,
+            Key::E  => 164.81,
+            Key::F  => 174.61,
+            Key::Fs => 185.00,
+            Key::G  => 196.00,
+            Key::Gs => 207.65,
+            Key::A  => 220.00,
+            Key::As => 233.08,
+            Key::B  => 246.94,
+        }
+    }
+
     /// TTS spelling — SAPI reads "#" as "hash", so spell sharps out.
     pub fn spoken(self) -> &'static str {
         match self {
@@ -120,6 +138,11 @@ impl Key {
     }
 }
 
+/// Reserved id of the built-in "Generated Pads" bank. It maps no files, so
+/// every key falls through to the on-the-fly synth. Always present; can't be
+/// removed.
+pub const BUILTIN_SYNTH_ID: &str = "__builtin_synth__";
+
 /// A set of pad files (one per key) in one folder.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Preset {
@@ -132,6 +155,23 @@ pub struct Preset {
     /// manual assignment. `serde(default)` keeps pre-field settings loadable.
     #[serde(default)]
     pub unmapped: Vec<PathBuf>,
+}
+
+impl Preset {
+    /// The built-in synth bank: no folder, no files — pure generated pads.
+    pub fn builtin_synth() -> Preset {
+        Preset {
+            id: BUILTIN_SYNTH_ID.to_string(),
+            name: "Generated Pads".to_string(),
+            folder: PathBuf::new(),
+            files: HashMap::new(),
+            unmapped: Vec::new(),
+        }
+    }
+
+    pub fn is_builtin_synth(&self) -> bool {
+        self.id == BUILTIN_SYNTH_ID
+    }
 }
 
 /// Saved pad/click/cue routing for one device, so reselecting it restores the
@@ -271,6 +311,18 @@ impl Settings {
     pub fn active_preset(&self) -> Option<&Preset> {
         let id = self.active_preset.as_deref()?;
         self.presets.iter().find(|p| p.id == id)
+    }
+
+    /// Guarantee the built-in "Generated Pads" bank exists at the top of the
+    /// list. Called on load so it's always a selectable option alongside any
+    /// imported folders. Defaults the active bank to it on first run.
+    pub fn ensure_builtin_synth(&mut self) {
+        if !self.presets.iter().any(|p| p.is_builtin_synth()) {
+            self.presets.insert(0, Preset::builtin_synth());
+        }
+        if self.active_preset.is_none() {
+            self.active_preset = Some(BUILTIN_SYNTH_ID.to_string());
+        }
     }
 
     /// Stable map key for per-device routing memory.

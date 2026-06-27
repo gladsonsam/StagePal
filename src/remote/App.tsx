@@ -23,6 +23,7 @@ interface TabContext {
   now: NowPlaying;
   padStyle: PadStyle;
   onPadStyle: (s: PadStyle) => void;
+  refreshInfo: () => Promise<void>;
 }
 
 interface TabDef {
@@ -52,7 +53,9 @@ const TABS: TabDef[] = [
     key: "cues",
     label: "Cues",
     Icon: CuesTabIcon,
-    render: ({ info, now }) => <CuesTab info={info} now={now} />,
+    render: ({ info, now, refreshInfo }) => (
+      <CuesTab info={info} now={now} refreshInfo={refreshInfo} />
+    ),
   },
 ];
 
@@ -66,7 +69,7 @@ function loadTab(): Tab {
 }
 
 export default function App() {
-  const { info, now, conn } = useRemoteState();
+  const { info, now, conn, refreshInfo } = useRemoteState();
   const [tab, setTab] = useState<Tab>(loadTab);
   const [padStyle, setPadStyle] = useState<PadStyle>(loadPadStyle);
 
@@ -78,7 +81,7 @@ export default function App() {
   }, [padStyle]);
 
   const active = TABS.find((t) => t.key === tab) ?? TABS[0];
-  const ctx: TabContext = { info, now, padStyle, onPadStyle: setPadStyle };
+  const ctx: TabContext = { info, now, padStyle, onPadStyle: setPadStyle, refreshInfo };
 
   return (
     <>

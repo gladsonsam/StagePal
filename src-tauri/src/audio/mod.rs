@@ -2,5 +2,6 @@
 
 mod decode;
 mod engine;
+pub(super) mod synth;
 
 pub use engine::{AudioDebugReport, AudioEngine, DeviceInfo, EngineEvent};

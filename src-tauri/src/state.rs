@@ -19,10 +19,12 @@ pub struct CoreState {
 impl CoreState {
     /// Load settings, or defaults if missing/corrupt.
     pub fn load(config_path: PathBuf) -> Self {
-        let settings = std::fs::read_to_string(&config_path)
+        let mut settings = std::fs::read_to_string(&config_path)
             .ok()
             .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
             .unwrap_or_default();
+        // Always offer the built-in generated-pads bank, even for older configs.
+        settings.ensure_builtin_synth();
 
         let now = NowPlaying {
             volume: settings.master_volume,

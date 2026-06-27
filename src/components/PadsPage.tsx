@@ -1,6 +1,7 @@
 // Pads page — pick a chord, set master volume, big stop button.
 
 import {
+  BUILTIN_SYNTH_ID,
   playKey,
   setVolume,
   stopPads,
@@ -45,6 +46,7 @@ export function PadsPage({
   const playingKey = playing ? ((now?.key ?? null) as Note | null) : null;
   const liveVolume = Math.round((now?.volume ?? settings.master_volume) * 100);
   const mappedCount = Object.keys(assignments).length;
+  const isBuiltinSynth = activePreset?.id === BUILTIN_SYNTH_ID;
 
   return (
     <Card pad={28} style={{ display: "flex", flexDirection: "column" }}>
@@ -58,7 +60,7 @@ export function PadsPage({
           </span>
           {activePreset && (
             <span className="mono" style={{ fontSize: 12, color: "var(--text-3)" }}>
-              {mappedCount} / 12 keys
+              {isBuiltinSynth ? "generated" : `${mappedCount} / 12 keys`}
             </span>
           )}
         </div>
@@ -75,26 +77,33 @@ export function PadsPage({
         </div>
       </div>
 
-      {activePreset ? (
-        <div style={{ marginTop: 24, marginBottom: 4 }}>
-          <PadCluster
-            variant={padStyle}
-            playing={playingKey}
-            assignments={assignments}
-            cols={6}
-            h={88}
-            big
-            onTrigger={(n) => guard(() => playKey(n as Key))}
-          />
-        </div>
-      ) : (
-        <div className="pads-empty">
-          <p>Pick or add a bank in the Library to start playing.</p>
-          <button className="btn btn-accent" onClick={onGoLibrary}>
-            <Icon name="folder" size={15} stroke="var(--on-accent)" /> Open library
-          </button>
-        </div>
-      )}
+      <div style={{ marginTop: 24, marginBottom: 4 }}>
+        <PadCluster
+          variant={padStyle}
+          playing={playingKey}
+          assignments={assignments}
+          cols={6}
+          h={88}
+          big
+          onTrigger={(n) => guard(() => playKey(n as Key))}
+        />
+      </div>
+
+      <div className="pads-synth-hint">
+        <Icon name="waves" size={14} stroke="var(--text-3)" />
+        <span>
+          {isBuiltinSynth
+            ? "Every key plays a generated worship pad. "
+            : mappedCount === 12
+              ? "Every key has a file."
+              : "Keys without a file play a generated worship pad. "}
+          {mappedCount < 12 && (
+            <button className="linklike" onClick={onGoLibrary}>
+              {isBuiltinSynth ? "Add your own pads in the Library" : "Add your own in the Library"}
+            </button>
+          )}
+        </span>
+      </div>
 
       <div
         style={{

@@ -196,6 +196,28 @@ body {
   font-size: 14px;
 }
 
+.pads-synth-hint {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 14px;
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+.linklike {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.linklike:hover {
+  color: var(--accent-ink);
+}
+
 .routing-head {
   display: flex;
   align-items: center;
@@ -540,21 +562,24 @@ button {
   color: var(--text);
   transition: background 0.2s ease, border-color 0.2s ease, transform 0.06s ease;
 }
-.pad:hover:not(.empty):not(.active) {
+.pad:hover:not(.active) {
   border-color: var(--line-2);
 }
 .pad:active:not(:disabled) {
   transform: translateY(1px);
 }
-.pad.empty {
+.pad.synth {
   background: var(--surface-2);
-  opacity: 0.62;
+  border-style: dashed;
   box-shadow: none;
-  cursor: not-allowed;
+}
+.pad.synth:hover:not(.active) {
+  border-color: color-mix(in oklch, var(--accent) 45%, var(--line));
 }
 .pad.active {
   background: color-mix(in oklch, var(--accent) 16%, var(--surface));
   border-color: color-mix(in oklch, var(--accent) 45%, transparent);
+  border-style: solid;
   box-shadow: 0 2px 10px color-mix(in oklch, var(--accent) 18%, transparent);
 }
 .pad-note {
@@ -562,8 +587,8 @@ button {
   letter-spacing: -0.01em;
   color: var(--text);
 }
-.pad.empty .pad-note {
-  color: var(--text-3);
+.pad.synth .pad-note {
+  color: var(--text-2);
 }
 .pad.active .pad-note,
 .pad.active .pad-file {
@@ -579,8 +604,9 @@ button {
 .pad-file.mono {
   font-family: var(--mono);
 }
-.pad-file.empty-label {
+.pad-file.synth-label {
   font-style: italic;
+  color: color-mix(in oklch, var(--accent) 60%, var(--text-3));
 }
 .pad-top {
   display: flex;
@@ -650,6 +676,12 @@ button {
   background: var(--accent);
   opacity: 0.85;
 }
+.pkey-dot.synth {
+  background: color-mix(in oklch, var(--accent) 55%, transparent);
+}
+.pkey.synth {
+  border-style: dashed;
+}
 .bkey {
   position: absolute;
   top: 0;
@@ -697,6 +729,9 @@ button {
 }
 .bkey-dot.has {
   background: var(--accent);
+}
+.bkey-dot.synth {
+  background: color-mix(in oklch, var(--accent) 55%, rgba(255, 255, 255, 0.28));
 }
 
 /* ─────────────────────────── crossfade labels ─────────────────────── */
@@ -772,6 +807,14 @@ button {
 .bank-pill.full {
   color: var(--accent-ink);
   background: color-mix(in oklch, var(--accent) 13%, var(--surface));
+}
+.bank-pill.synth {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--accent-ink);
+  background: color-mix(in oklch, var(--accent) 13%, var(--surface));
+  border-color: color-mix(in oklch, var(--accent) 30%, var(--line));
 }
 .bank-chevron {
   background: none;

@@ -123,18 +123,18 @@ function PadButton({
   active: boolean;
   onTrigger: (k: Key) => void;
 }) {
+  const synth = !mapped;
   return (
     <button
       type="button"
-      className={`pad${active ? " active" : ""}`}
-      disabled={!mapped}
-      onClick={mapped ? () => onTrigger(k) : undefined}
+      className={`pad${active ? " active" : ""}${synth ? " synth" : ""}`}
+      onClick={() => onTrigger(k)}
     >
       <span className="pad-top">
         <span className="note">{k}</span>
         {active && <Meter />}
       </span>
-      <span className={`file${file ? "" : " empty"}`}>{file || "empty"}</span>
+      <span className={`file${synth ? " synth" : ""}`}>{file ?? "generated"}</span>
     </button>
   );
 }
@@ -163,9 +163,8 @@ function PianoKeyPair({
     <div className="pkey-wrap">
       <button
         type="button"
-        className={`pkey${whiteActive ? " active" : ""}`}
-        disabled={!whiteHas}
-        onClick={whiteHas ? () => onTrigger(white) : undefined}
+        className={`pkey${whiteActive ? " active" : ""}${whiteHas ? "" : " synth"}`}
+        onClick={() => onTrigger(white)}
       >
         {whiteActive && (
           <span style={{ marginBottom: 4 }}>
@@ -173,17 +172,16 @@ function PianoKeyPair({
           </span>
         )}
         <span className="note">{white}</span>
-        <span className={`dot${whiteHas ? " has" : ""}`} />
+        <span className={`dot${whiteHas ? " has" : " synth"}`} />
       </button>
       {black && (
         <button
           type="button"
-          className={`bkey${blackActive ? " active" : ""}`}
-          disabled={!blackHas}
-          onClick={blackHas ? () => onTrigger(black) : undefined}
+          className={`bkey${blackActive ? " active" : ""}${blackHas ? "" : " synth"}`}
+          onClick={() => onTrigger(black)}
         >
           <span className="note">{black}</span>
-          <span className={`dot${blackHas ? " has" : ""}`} />
+          <span className={`dot${blackHas ? " has" : " synth"}`} />
         </button>
       )}
     </div>

@@ -21,7 +21,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::audio::AudioEngine;
 use crate::commands::{self, CueSynth};
-use crate::model::now_unix_ms;
+use crate::model::{now_unix_ms, QuickCue};
 use crate::state::CoreState;
 
 const REMOTE_HTML: &str = include_str!("../assets/remote.html");
@@ -65,6 +65,9 @@ pub async fn serve(app: AppHandle, port: u16) {
         .route("/api/cue/speak", post(cue_speak))
         .route("/api/cue/quick/:id", post(cue_quick))
         .route("/api/cue/stop", post(cue_stop))
+        .route("/api/cue/add", post(cue_add_handler))
+        .route("/api/cue/update/:id", post(cue_update_handler))
+        .route("/api/cue/remove/:id", post(cue_remove_handler))
         .route("/api/sync", post(sync))
         .route("/ws", get(ws_upgrade))
         .layer(CorsLayer::permissive())
@@ -409,6 +412,53 @@ async fn sync(State(app): State<AppHandle>, raw: axum::body::Bytes) -> Response 
             )?;
         }
         Ok(())
+    })
+    .await;
+    map_result(r)
+}
+
+#[derive(Deserialize)]
+struct CueSaveBody {
+    label: String,
+    text: String,
+}
+
+async fn cue_add_handler(
+    State(app): State<AppHandle>,
+    Json(body): Json<CueSaveBody>,
+) -> Response {
+    let r: Result<QuickCue, String> = tokio::task::spawn_blocking(move || {
+        let core = app.state::<CoreState>();
+        commands::cue_add_logic(core.inner(), body.label, body.text)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("remote worker panic: {e}")));
+    match r {
+        Ok(cue) => Json(cue).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+async fn cue_update_handler(
+    State(app): State<AppHandle>,
+    Path(id): Path<String>,
+    Json(body): Json<CueSaveBody>,
+) -> Response {
+    let r = run_blocking(move || {
+        let core = app.state::<CoreState>();
+        commands::cue_update_logic(core.inner(), &id, body.label, body.text)
+    })
+    .await;
+    map_result(r)
+}
+
+async fn cue_remove_handler(
+    State(app): State<AppHandle>,
+    Path(id): Path<String>,
+) -> Response {
+    let r = run_blocking(move || {
+        let core = app.state::<CoreState>();
+        commands::cue_remove_logic(core.inner(), &id)
     })
     .await;
     map_result(r)

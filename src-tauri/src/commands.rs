@@ -70,10 +70,11 @@ pub fn play_key_logic(
             s.cues.speak_key_on_change,
         )
     };
-    let path =
-        path.ok_or_else(|| format!("no file mapped for key {} in the active preset", k.as_str()))?;
 
-    engine.play(path)?;
+    match path {
+        Some(p) => engine.play(p)?,
+        None => engine.play_synth(k.freq())?,
+    };
     {
         let mut n = core.now.lock().unwrap();
         n.key = Some(k);
@@ -119,15 +120,17 @@ pub fn set_preset_logic(
     }
     core.save()?;
 
-    // If a key is playing, crossfade into the same key of the new preset.
+    // If a key is playing, crossfade into the same key of the new preset —
+    // falling through to the generated pad when the new bank has no file.
     let current_key = core.now.lock().unwrap().key;
     if let Some(k) = current_key {
         let path = {
             let s = core.settings.lock().unwrap();
             resolve_file(&s, k)
         };
-        if let Some(p) = path {
-            engine.play(p)?;
+        match path {
+            Some(p) => engine.play(p)?,
+            None => engine.play_synth(k.freq())?,
         }
     }
     core.now.lock().unwrap().preset = Some(id.to_string());
@@ -374,7 +377,14 @@ pub fn scan_library(
         };
         s.presets.retain(|p| p.id != merged.id);
         s.presets.push(merged.clone());
-        if s.active_preset.is_none() {
+        // Auto-activate the first real folder a user imports (the active bank
+        // otherwise defaults to the built-in generated-pads bank).
+        let active_is_builtin = s
+            .active_preset
+            .as_deref()
+            .map(|id| id == crate::model::BUILTIN_SYNTH_ID)
+            .unwrap_or(true);
+        if active_is_builtin {
             s.active_preset = Some(merged.id.clone());
         }
         merged
@@ -429,6 +439,9 @@ pub fn set_crossfade(
 
 #[tauri::command]
 pub fn remove_preset(core: State<'_, CoreState>, id: String) -> Result<(), String> {
+    if id == crate::model::BUILTIN_SYNTH_ID {
+        return Err("the Generated Pads bank is built in and can't be removed".into());
+    }
     {
         let mut s = core.settings.lock().unwrap();
         s.presets.retain(|p| p.id != id);

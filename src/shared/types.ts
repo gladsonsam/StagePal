@@ -9,6 +9,9 @@ export const ALL_KEYS: Key[] = [
   "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
 ];
 
+/** Reserved id of the built-in "Generated Pads" bank (every key is synthesized). */
+export const BUILTIN_SYNTH_ID = "__builtin_synth__";
+
 export interface ClickNow {
   enabled: boolean;
   bpm: number;

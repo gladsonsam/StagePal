@@ -4,6 +4,7 @@
 import { useRef, useState } from "react";
 import {
   ALL_KEYS,
+  BUILTIN_SYNTH_ID,
   assignKey,
   clearKey,
   removePreset,
@@ -35,14 +36,15 @@ export function LibraryPage({ settings, onAddFolder, guard, refreshSettings }: P
         </button>
       </div>
 
-      {settings.presets.length === 0 ? (
+      {!settings.presets.some((p) => p.id !== BUILTIN_SYNTH_ID) && (
         <p className="empty-note">
-          No pads yet. Add a folder of audio files — keys are detected from the file names
-          (e.g. <code>C.wav</code>, <code>F# Pad.mp3</code>).
+          The <strong>Generated Pads</strong> bank below works out of the box — every key
+          plays a synthesized worship pad. Or add a folder of audio files to use your own
+          (keys are detected from file names, e.g. <code>C.wav</code>, <code>F# Pad.mp3</code>).
         </p>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          {settings.presets.map((p) => (
+      )}
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        {settings.presets.map((p) => (
             <Bank
               key={p.id}
               preset={p}
@@ -79,8 +81,7 @@ export function LibraryPage({ settings, onAddFolder, guard, refreshSettings }: P
               }
             />
           ))}
-        </div>
-      )}
+      </div>
     </Card>
   );
 }
@@ -111,6 +112,7 @@ function Bank({
   const files = preset.files;
   const count = Object.keys(files).length;
   const unmapped = preset.unmapped ?? [];
+  const builtin = preset.id === BUILTIN_SYNTH_ID;
 
   function commitName() {
     setEditing(false);
@@ -127,7 +129,7 @@ function Bank({
           title={active ? "Active bank" : "Make active"}
           onClick={onActivate}
         />
-        {editing ? (
+        {editing && !builtin ? (
           <input
             ref={inputRef}
             className="bank-name-input"
@@ -144,20 +146,32 @@ function Bank({
             }}
           />
         ) : (
-          <button className="bank-name" onDoubleClick={() => setEditing(true)} onClick={onActivate}>
+          <button
+            className="bank-name"
+            onDoubleClick={builtin ? undefined : () => setEditing(true)}
+            onClick={onActivate}
+          >
             {preset.name}
           </button>
         )}
-        <span className={`bank-pill${count === 12 ? " full" : ""}`}>{count}/12 keys</span>
+        {builtin ? (
+          <span className="bank-pill synth">
+            <Icon name="waves" size={12} stroke="currentColor" /> Synth
+          </span>
+        ) : (
+          <span className={`bank-pill${count === 12 ? " full" : ""}`}>{count}/12 keys</span>
+        )}
         <div style={{ flex: 1 }} />
-        <div style={{ display: "flex", gap: 6 }}>
-          <button className="icon-btn" title="Rename" onClick={() => setEditing(true)}>
-            <Icon name="pencil" size={15} stroke="var(--text-2)" />
-          </button>
-          <button className="icon-btn" title="Remove" onClick={onRemove}>
-            <Icon name="trash" size={15} stroke="var(--text-2)" />
-          </button>
-        </div>
+        {!builtin && (
+          <div style={{ display: "flex", gap: 6 }}>
+            <button className="icon-btn" title="Rename" onClick={() => setEditing(true)}>
+              <Icon name="pencil" size={15} stroke="var(--text-2)" />
+            </button>
+            <button className="icon-btn" title="Remove" onClick={onRemove}>
+              <Icon name="trash" size={15} stroke="var(--text-2)" />
+            </button>
+          </div>
+        )}
         <button
           className="bank-chevron"
           title={open ? "Collapse" : "Expand"}
@@ -167,7 +181,17 @@ function Bank({
         </button>
       </div>
 
-      {open && (
+      {open && builtin && (
+        <div className="bank-body">
+          <p className="empty-note" style={{ margin: 0 }}>
+            All 12 keys play a synthesized worship pad — a warm, detuned pad with a long
+            reverb tail, tuned to each key. No files needed. Select this bank, then play
+            from the Pads page or your phone.
+          </p>
+        </div>
+      )}
+
+      {open && !builtin && (
         <div className="bank-body">
           <div className="slot-grid">
             {NOTES.map((n) => {
